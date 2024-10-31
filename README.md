@@ -54,6 +54,18 @@ No changes are made to Deluge's configuration, not files are deleted.
 docker run -v /mnt/tank/data/orphaned_files.json:/app/orphaned_files.json \
            -v /mnt/tank/data/torrents:/data/torrents \
            -v /mnt/tank/data/media:/data/media \
+           -e DELUGE_HOST=localhost \
+           -e DELUGE_PORT=58846 \
+           -e DELUGE_USERNAME=admin \
+           -e DELUGE_PASSWORD=password \
+           -e DELUGE_TORRENT_BASE_REMOTE_FOLDER=/data/torrents \
+           -e LOCAL_TORRENT_BASE_LOCAL_FOLDER=/data/torrents \
+           -e LOCAL_MEDIA_BASE_LOCAL_FOLDER=/data/media \
+           -e OUTPUT_FILE=orphaned_files.json \
+           -e EXTENSIONS_BLACKLIST=.nfo,.srt,.jpg \
+           -e LOCAL_SUBFOLDERS_BLACKLIST=music,ebooks,courses \
+           -e CACHE_SAVE_INTERVAL=25 \
+           -e TZ=Europe/Paris \
            fiveboroughs/deluge-orphaned-files
 ```
 
