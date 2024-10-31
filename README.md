@@ -51,15 +51,15 @@ No changes are made to Deluge's configuration, not files are deleted.
 
 ### Docker (Recommended)
 ```bash
-docker run -v /path/to/config:/config \
-           -v /path/to/downloads:/downloads \
-           -v /path/to/media:/media \
+docker run -v /mnt/tank/data/orphaned_files.json:/app/orphaned_files.json \
+           -v /mnt/tank/data/torrents:/data/torrents \
+           -v /mnt/tank/data/media:/data/media \
            fiveboroughs/deluge-orphaned-files
 ```
 
 ### Manual Installation
 ```bash
-git clone https://github.com/yourusername/deluge-orphaned-files.git
+git clone https://github.com/fiveboroughs/deluge-orphaned-files.git
 cd deluge-orphaned-files
 pip install -r requirements.txt
 ```
@@ -80,12 +80,12 @@ DELUGE_USERNAME=admin
 DELUGE_PASSWORD=password
 
 # Paths
-DELUGE_TORRENT_BASE_REMOTE_FOLDER=/downloads
-LOCAL_TORRENT_BASE_LOCAL_FOLDER=/downloads
-LOCAL_MEDIA_BASE_LOCAL_FOLDER=/media
+DELUGE_TORRENT_BASE_REMOTE_FOLDER=/data/torrents
+LOCAL_TORRENT_BASE_LOCAL_FOLDER=/data/torrents
+LOCAL_MEDIA_BASE_LOCAL_FOLDER=/data/media
 
 # Optional settings
-OUTPUT_FILE=scan_results.json
+OUTPUT_FILE=orphaned_files.json
 EXTENSIONS_BLACKLIST=.nfo,.srt,.jpg
 LOCAL_SUBFOLDERS_BLACKLIST=music,ebooks,courses
 CACHE_SAVE_INTERVAL=25
