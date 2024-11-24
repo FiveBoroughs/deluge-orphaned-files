@@ -78,6 +78,26 @@ def verify_paths():
 
     return True
 
+
+    # Helper function to check if file should be processed
+def should_process_file(filepath: Path) -> bool:
+    # Check both the suffix and the full filename
+    if (filepath.suffix.lower() in EXTENSIONS_BLACKLIST or
+        filepath.name in EXTENSIONS_BLACKLIST):
+        return False
+
+    # Check for sample files and featurettes
+    path_lower = str(filepath.parent).lower()
+    if any(pattern in path_lower for pattern in [
+        '/sample',
+        '/featurettes',
+        '.sample',
+        '-sample'
+    ]):
+        return False
+
+    return True
+
 def get_deluge_files():
     client = DelugeRPCClient(DELUGE_HOST, DELUGE_PORT, DELUGE_USERNAME, DELUGE_PASSWORD)
     client.connect()
@@ -129,12 +149,12 @@ def get_local_files(folder):
 
     # First, count total files for the progress bar
     total_files = 0
-    for root, _, files in os.walk(folder):
+    for root, dirs, files in os.walk(folder):
         # Check if this is a blacklisted first-level subdirectory
         relative_root = Path(root).relative_to(folder)
         if relative_root.parts and relative_root.parts[0] in LOCAL_SUBFOLDERS_BLACKLIST:
             continue
-        total_files += sum(1 for f in files if Path(f).suffix.lower() not in EXTENSIONS_BLACKLIST)
+        total_files += sum(1 for f in files if should_process_file(Path(os.path.join(root, f))))
 
     files_since_last_save = 0
     with tqdm(total=total_files, desc=f"Scanning {Path(folder).name}") as pbar:
@@ -145,41 +165,44 @@ def get_local_files(folder):
                 continue
 
             for file in files:
-                if Path(file).suffix.lower() not in EXTENSIONS_BLACKLIST:
-                    full_path = os.path.join(root, file)
-                    relative_path = os.path.relpath(full_path, folder)
+                full_path = os.path.join(root, file)
+                if not should_process_file(Path(full_path)):
+                    continue
 
-                    mtime = os.path.getmtime(full_path)
-                    cache_key = relative_path
-                    cache_hit = False
+                relative_path = os.path.relpath(full_path, folder)
+                file_size = os.path.getsize(full_path)
 
-                    if cache_key in hash_cache:
-                        cached_mtime = float(hash_cache[cache_key]['mtime'])
-                        # Allow for 2 second difference
-                        if abs(cached_mtime - mtime) <= 2:
-                            cache_hit = True
-                        else:
-                            logger.debug(f"Cache miss for {cache_key}: cached_mtime={cached_mtime}, current_mtime={mtime}")
+                mtime = os.path.getmtime(full_path)
+                cache_key = relative_path
+                cache_hit = False
 
-                    if cache_hit:
-                        file_hash = hash_cache[cache_key]['hash']
-                        logger.debug(f"Cache hit for {cache_key}")
+                if cache_key in hash_cache:
+                    cached_mtime = float(hash_cache[cache_key]['mtime'])
+                    # Allow for 2 second difference
+                    if abs(cached_mtime - mtime) <= 2:
+                        cache_hit = True
                     else:
-                        logger.debug(f"Cache miss for {cache_key}")
-                        file_hash = get_file_hash(full_path)
-                        hash_cache[cache_key] = {
-                            'hash': file_hash,
-                            'mtime': mtime
-                        }
-                        files_since_last_save += 1
+                        logger.debug(f"Cache miss for {cache_key}: cached_mtime={cached_mtime}, current_mtime={mtime}")
 
-                    # Save cache every interval of new/modified files
-                    if files_since_last_save >= CACHE_SAVE_INTERVAL:
-                        save_hash_cache(cache_file, hash_cache)
-                        files_since_last_save = 0
-                        logger.debug(f"Cache write, {len(hash_cache)} total cache entries")
+                if cache_hit:
+                    file_hash = hash_cache[cache_key]['hash']
+                    logger.debug(f"Cache hit for {cache_key}")
+                else:
+                    logger.debug(f"Cache miss for {cache_key}")
+                    file_hash = get_file_hash(full_path)
+                    hash_cache[cache_key] = {
+                        'hash': file_hash,
+                        'mtime': mtime
+                    }
+                    files_since_last_save += 1
 
-                    local_files[relative_path] = file_hash
+                # Save cache every interval of new/modified files
+                if files_since_last_save >= CACHE_SAVE_INTERVAL:
+                    save_hash_cache(cache_file, hash_cache)
+                    files_since_last_save = 0
+                    logger.debug(f"Cache write, {len(hash_cache)} total cache entries")
+
+                local_files[relative_path] = {'hash': file_hash, 'size': file_size}
                 pbar.update(1)
 
     # Final save of the cache
@@ -214,6 +237,20 @@ def find_orphaned_files(skip_media_check=False):
         local_torrent_files = get_local_files(LOCAL_TORRENT_BASE_LOCAL_FOLDER)
         logger.info(f"Found {len(local_torrent_files)} files in local torrent folder.")
 
+        # Get orphaned files with their sizes
+        orphaned_torrent_files = [
+            {
+                "path": path,
+                "size": info['size'],
+                "size_human": f"{info['size'] / (1024**3):.2f} GB" if info['size'] >= 1024**3 else
+                            f"{info['size'] / (1024**2):.2f} MB"
+            }
+            for path, info in local_torrent_files.items()
+            if path not in deluge_files
+        ]
+        # Sort by size
+        orphaned_torrent_files.sort(key=lambda x: x["size"], reverse=True)
+
         logger.info("Comparing files in deluge against files in the local torrent folder...")
         orphaned_torrent_files = sorted(list(set(local_torrent_files.keys()) - deluge_files))
         logger.info(f"Found {len(orphaned_torrent_files)} files in the local torrent folder that are not in Deluge.")
@@ -230,36 +267,45 @@ def find_orphaned_files(skip_media_check=False):
         local_media_files = get_local_files(LOCAL_MEDIA_BASE_LOCAL_FOLDER)
         logger.info(f"Found {len(local_media_files)} files in local media folder.")
 
-        #logger.info("Comparing files in deluge against files in the local torrent folder...")
-        #orphaned_torrent_files = sorted(list(local_torrent_files - deluge_files))
-        #logger.info(f"Found {len(orphaned_torrent_files)} files in the local torrent folder that are not in Deluge.")
-
         # Compare files based on their hashes
         # Exclude files in blacklisted subfolders and with blacklisted extensions
-        torrent_hashes = {hash: name for name, hash in local_torrent_files.items()
-                          if not any(name.startswith(subfolder + '/') for subfolder in LOCAL_SUBFOLDERS_BLACKLIST)
-                          and Path(name).suffix.lower() not in EXTENSIONS_BLACKLIST}
-        media_hashes = {hash: name for name, hash in local_media_files.items()
-                        if not any(name.startswith(subfolder + '/') for subfolder in LOCAL_SUBFOLDERS_BLACKLIST)
-                        and Path(name).suffix.lower() not in EXTENSIONS_BLACKLIST}
+        torrent_hashes = {info['hash']: (name, info['size'])
+                         for name, info in local_torrent_files.items()
+                         if not any(name.startswith(subfolder + '/')
+                                  for subfolder in LOCAL_SUBFOLDERS_BLACKLIST)}
+        media_hashes = {info['hash']: (name, info['size'])
+                       for name, info in local_media_files.items()
+                       if not any(name.startswith(subfolder + '/')
+                                for subfolder in LOCAL_SUBFOLDERS_BLACKLIST)}
 
         # Pre-filter collections before set operations
         torrent_set = frozenset(torrent_hashes.keys())
         media_set = frozenset(media_hashes.keys())
 
-        only_in_torrents = sorted([torrent_hashes[hash] for hash in torrent_set - media_set])
-        only_in_media = sorted([media_hashes[hash] for hash in media_set - torrent_set])
 
-        logger.info(f"Found {len(only_in_torrents)} files only in torrents folder")
-        logger.info(f"Found {len(only_in_media)} files only in media folder")
+        # Get files only in torrents with sizes
+        only_in_torrents = [
+            {
+                "path": torrent_hashes[hash][0],
+                "size": torrent_hashes[hash][1],
+                "size_human": f"{torrent_hashes[hash][1] / (1024**3):.2f} GB" if torrent_hashes[hash][1] >= 1024**3 else
+                            f"{torrent_hashes[hash][1] / (1024**2):.2f} MB"
+            }
+            for hash in torrent_set - media_set
+        ]
+        only_in_torrents.sort(key=lambda x: x["size"], reverse=True)
 
-        # If you want to see which files correspond to each other despite different names:
-        renamed_files = []
-        for hash in torrent_set.intersection(media_set):
-            if torrent_hashes[hash] != media_hashes[hash]:
-                renamed_files.append((torrent_hashes[hash], media_hashes[hash]))
-
-        logger.info(f"Found {len(renamed_files)} files that were renamed")
+        # Get files only in media with sizes
+        only_in_media = [
+            {
+                "path": media_hashes[hash][0],
+                "size": media_hashes[hash][1],
+                "size_human": f"{media_hashes[hash][1] / (1024**3):.2f} GB" if media_hashes[hash][1] >= 1024**3 else
+                            f"{media_hashes[hash][1] / (1024**2):.2f} MB"
+            }
+            for hash in media_set - torrent_set
+        ]
+        only_in_media.sort(key=lambda x: x["size"], reverse=True)
 
         # Save results regardless of whether orphans were found
         logger.info(f"\nScan complete. Found {len(orphaned_torrent_files)} orphans, {len(only_in_torrents)} files only in torrents, {len(only_in_media)} files only in media")
@@ -282,7 +328,7 @@ def save_scan_results(
         "scan_end": datetime.now().isoformat(),
         "in_local_torrent_folder_but_not_deluge": orphaned_torrent_files,
         "files_only_in_torrents": only_in_torrents,
-        "files_only_in_media": only_in_media
+        "files_only_in_media": only_in_media,
     }
 
     try:
@@ -299,10 +345,9 @@ def clean_hash_cache(folder: Path) -> None:
     current_files = set()
     for root, _, files in os.walk(folder):
         for file in files:
-            if Path(file).suffix.lower() not in EXTENSIONS_BLACKLIST:
-                full_path = os.path.join(root, file)
-                relative_path = os.path.relpath(full_path, folder)
-                current_files.add(relative_path)
+            full_path = os.path.join(root, file)
+            relative_path = os.path.relpath(full_path, folder)
+            current_files.add(relative_path)
 
     # Remove entries for files that no longer exist
     updated_cache = {k: v for k, v in hash_cache.items() if k in current_files}
