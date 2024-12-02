@@ -87,10 +87,11 @@ def should_process_file(filepath: Path) -> bool:
         return False
 
     # Check for sample files and featurettes
-    path_lower = str(filepath.parent).lower()
+    path_lower = str(filepath).lower()
     if any(pattern in path_lower for pattern in [
         '/sample',
         '/featurettes',
+        '/extras',
         '.sample',
         '-sample'
     ]):
@@ -269,7 +270,7 @@ def find_orphaned_files(skip_media_check=False):
 
         # Compare files based on their hashes
         # Exclude files in blacklisted subfolders and with blacklisted extensions
-        torrent_hashes = {info['hash']: (name, info['size'])
+        torrent_hashes = {info['hash']: (name, info['size'], file_labels.get(name, "none"))
                          for name, info in local_torrent_files.items()
                          if not any(name.startswith(subfolder + '/')
                                   for subfolder in LOCAL_SUBFOLDERS_BLACKLIST)}
@@ -287,13 +288,14 @@ def find_orphaned_files(skip_media_check=False):
         only_in_torrents = [
             {
                 "path": torrent_hashes[hash][0],
+                "label": torrent_hashes[hash][2],
                 "size": torrent_hashes[hash][1],
                 "size_human": f"{torrent_hashes[hash][1] / (1024**3):.2f} GB" if torrent_hashes[hash][1] >= 1024**3 else
                             f"{torrent_hashes[hash][1] / (1024**2):.2f} MB"
             }
             for hash in torrent_set - media_set
         ]
-        only_in_torrents.sort(key=lambda x: x["size"], reverse=True)
+        only_in_torrents.sort(key=lambda x: ("a" if x["label"].startswith("other") else x["label"], x["size"]), reverse=True)
 
         # Get files only in media with sizes
         only_in_media = [
