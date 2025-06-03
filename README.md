@@ -13,6 +13,23 @@ This tool helps identify files that exist on disk but are not tracked by any act
 ## Directory Structure Example
 
 ```
+
+<!-- Environment Variable Explanations -->
+   Key environment variables to configure in your `.env` file (after copying from `.env.example`):
+   - `DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`: Connection details for your Deluge daemon.
+   - `DELUGE_TORRENT_BASE_REMOTE_FOLDER`: The absolute base path where Deluge stores torrent data (as seen by the Deluge daemon itself). For example, if Deluge saves to `/srv/downloads/torrents`, this should be `/srv/downloads/torrents`.
+   - `LOCAL_TORRENT_BASE_LOCAL_FOLDER`: The absolute base path where this script can access the same torrent data locally. This might be a direct path if running on the same machine as Deluge, or a mounted path (e.g., `/mnt/nas/downloads/torrents`) if accessing remotely. Ensure this path corresponds to the same directory level as `DELUGE_TORRENT_BASE_REMOTE_FOLDER` for accurate path comparisons.
+   - `LOCAL_MEDIA_BASE_LOCAL_FOLDER`: The absolute base path for your media library, if you are using the media comparison features.
+   - `EXTENSIONS_BLACKLIST`: A comma-separated list of file extensions (e.g., `.nfo`, `.txt`) or full filenames to ignore during local file scans. This is crucial for excluding metadata files, temporary files (like those ending in `.partial` or `.fastresume` if not handled by Deluge itself), or other unwanted file types (e.g., `.torrent.invalid`) from being processed or reported. Ensure a leading dot for extensions (e.g., `.jpg`, `.invalid`).
+   - `LOCAL_SUBFOLDERS_BLACKLIST`: A comma-separated list of top-level subfolder names within your `LOCAL_TORRENT_BASE_LOCAL_FOLDER` and `LOCAL_MEDIA_BASE_LOCAL_FOLDER` that should be entirely skipped during local scans (e.g., `music,ebooks,samples`).
+
+   Key environment variables to configure in your `.env` file include:
+   - `DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`: Connection details for your Deluge daemon.
+   - `DELUGE_TORRENT_BASE_REMOTE_FOLDER`: The absolute base path where Deluge stores torrent data (as seen by the Deluge daemon itself). For example, if Deluge saves to `/srv/downloads/torrents`, this should be `/srv/downloads/torrents`.
+   - `LOCAL_TORRENT_BASE_LOCAL_FOLDER`: The absolute base path where this script can access the same torrent data locally. This might be a direct path if running on the same machine as Deluge, or a mounted path (e.g., `/mnt/nas/downloads/torrents`) if accessing remotely. Ensure this path corresponds to the same directory level as `DELUGE_TORRENT_BASE_REMOTE_FOLDER` for accurate path comparisons.
+   - `LOCAL_MEDIA_BASE_LOCAL_FOLDER`: The absolute base path for your media library, if you are using the media comparison features.
+   - `EXTENSIONS_BLACKLIST`: A comma-separated list of file extensions (e.g., `.nfo`, `.txt`) or full filenames to ignore during local file scans. This is crucial for excluding metadata files, temporary files (like those ending in `.partial` or `.fastresume` if not handled by Deluge itself), or other unwanted file types (e.g., `.torrent.invalid`) from being processed or reported. Ensure a leading dot for extensions (e.g., `.jpg`, `.invalid`).
+   - `LOCAL_SUBFOLDERS_BLACKLIST`: A comma-separated list of top-level subfolder names within your `LOCAL_TORRENT_BASE_LOCAL_FOLDER` and `LOCAL_MEDIA_BASE_LOCAL_FOLDER` that should be entirely skipped during local scans (e.g., `music,ebooks,samples`).
 data/
 ├── torrents/
 │   ├── movies/
@@ -39,6 +56,7 @@ No changes are made to Deluge's configuration, not files are deleted.
 - Progress bars for long operations
 - Configurable file/folder exclusions
 - Detailed logging options
+- **Consistent path normalization**: Employs robust path normalization for both Deluge-reported paths and locally scanned file paths. This ensures reliable comparisons, prevents duplicate entries in the database, and improves overall data integrity for tracking files across different sources.
 
 ## Prerequisites
 
@@ -82,6 +100,37 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 ```
+
+<!-- Environment Variable Explanations -->
+   Key environment variables to configure in your `.env` file (after copying from `.env.example`):
+   - `DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`: Connection details for your Deluge daemon.
+   - `DELUGE_TORRENT_BASE_REMOTE_FOLDER`: The absolute base path where Deluge stores torrent data (as seen by the Deluge daemon itself). For example, if Deluge saves to `/srv/downloads/torrents`, this should be `/srv/downloads/torrents`.
+   - `LOCAL_TORRENT_BASE_LOCAL_FOLDER`: The absolute base path where this script can access the same torrent data locally. This might be a direct path if running on the same machine as Deluge, or a mounted path (e.g., `/mnt/nas/downloads/torrents`) if accessing remotely. Ensure this path corresponds to the same directory level as `DELUGE_TORRENT_BASE_REMOTE_FOLDER` for accurate path comparisons.
+   - `LOCAL_MEDIA_BASE_LOCAL_FOLDER`: The absolute base path for your media library, if you are using the media comparison features.
+   - `EXTENSIONS_BLACKLIST`: A comma-separated list of file extensions (e.g., `.nfo`, `.txt`) or full filenames to ignore during local file scans. This is crucial for excluding metadata files, temporary files (like those ending in `.partial` or `.fastresume` if not handled by Deluge itself), or other unwanted file types (e.g., `.torrent.invalid`) from being processed or reported. Ensure a leading dot for extensions (e.g., `.jpg`, `.invalid`).
+   - `LOCAL_SUBFOLDERS_BLACKLIST`: A comma-separated list of top-level subfolder names within your `LOCAL_TORRENT_BASE_LOCAL_FOLDER` and `LOCAL_MEDIA_BASE_LOCAL_FOLDER` that should be entirely skipped during local scans (e.g., `music,ebooks,samples`).
+
+
+<!-- Environment Variable Explanations -->
+   Key environment variables to configure in your `.env` file (after copying from `.env.example`):
+   - `DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`: Connection details for your Deluge daemon.
+   - `DELUGE_TORRENT_BASE_REMOTE_FOLDER`: The absolute base path where Deluge stores torrent data (as seen by the Deluge daemon itself). For example, if Deluge saves to `/srv/downloads/torrents`, this should be `/srv/downloads/torrents`.
+   - `LOCAL_TORRENT_BASE_LOCAL_FOLDER`: The absolute base path where this script can access the same torrent data locally. This might be a direct path if running on the same machine as Deluge, or a mounted path (e.g., `/mnt/nas/downloads/torrents`) if accessing remotely. Ensure this path corresponds to the same directory level as `DELUGE_TORRENT_BASE_REMOTE_FOLDER` for accurate path comparisons.
+   - `LOCAL_MEDIA_BASE_LOCAL_FOLDER`: The absolute base path for your media library, if you are using the media comparison features.
+   - `EXTENSIONS_BLACKLIST`: A comma-separated list of file extensions (e.g., `.nfo`, `.txt`) or full filenames to ignore during local file scans. This is crucial for excluding metadata files, temporary files (like those ending in `.partial` or `.fastresume` if not handled by Deluge itself), or other unwanted file types (e.g., `.torrent.invalid`) from being processed or reported. Ensure a leading dot for extensions (e.g., `.jpg`, `.invalid`).
+   - `LOCAL_SUBFOLDERS_BLACKLIST`: A comma-separated list of top-level subfolder names within your `LOCAL_TORRENT_BASE_LOCAL_FOLDER` and `LOCAL_MEDIA_BASE_LOCAL_FOLDER` that should be entirely skipped during local scans (e.g., `music,ebooks,samples`).
+
+   After configuring these, you can run the script using:
+```
+
+<!-- Environment Variable Explanations -->
+   Key environment variables to configure in your `.env` file (after copying from `.env.example`):
+   - `DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`, `DELUGE_PASSWORD`: Connection details for your Deluge daemon.
+   - `DELUGE_TORRENT_BASE_REMOTE_FOLDER`: The absolute base path where Deluge stores torrent data (as seen by the Deluge daemon itself). For example, if Deluge saves to `/srv/downloads/torrents`, this should be `/srv/downloads/torrents`.
+   - `LOCAL_TORRENT_BASE_LOCAL_FOLDER`: The absolute base path where this script can access the same torrent data locally. This might be a direct path if running on the same machine as Deluge, or a mounted path (e.g., `/mnt/nas/downloads/torrents`) if accessing remotely. Ensure this path corresponds to the same directory level as `DELUGE_TORRENT_BASE_REMOTE_FOLDER` for accurate path comparisons.
+   - `LOCAL_MEDIA_BASE_LOCAL_FOLDER`: The absolute base path for your media library, if you are using the media comparison features.
+   - `EXTENSIONS_BLACKLIST`: A comma-separated list of file extensions (e.g., `.nfo`, `.txt`) or full filenames to ignore during local file scans. This is crucial for excluding metadata files, temporary files (like those ending in `.partial` or `.fastresume` if not handled by Deluge itself), or other unwanted file types (e.g., `.torrent.invalid`) from being processed or reported. Ensure a leading dot for extensions (e.g., `.jpg`, `.invalid`).
+   - `LOCAL_SUBFOLDERS_BLACKLIST`: A comma-separated list of top-level subfolder names within your `LOCAL_TORRENT_BASE_LOCAL_FOLDER` and `LOCAL_MEDIA_BASE_LOCAL_FOLDER` that should be entirely skipped during local scans (e.g., `music,ebooks,samples`).
 
 2. Edit `.env` with your settings:
 ```bash
@@ -134,6 +183,33 @@ The script generates a JSON file with the following structure:
   "files_only_in_media": [...]
 }
 ```
+
+## Database and File Tracking (SQLite Backend)
+
+The script now utilizes an SQLite database (`orphaned_files.sqlite` by default, in the same directory as the script) to store scan results and track file history. This provides more robust data management and enables features like tracking files over multiple scans.
+
+Key tables and concepts:
+
+*   **`scan_results`**: Stores metadata about each scan run (host, paths, start/end times).
+*   **`orphaned_files`**: This is the central table tracking individual files identified in various categories.
+    *   `path`: The relative path of the file.
+    *   `source`: Indicates the context in which the file was found:
+        *   `'local_torrent_folder'`: Files present in the local torrent download directory but not registered in Deluge (true orphans).
+        *   `'torrents'`: Files registered in Deluge and found in the local torrent download directory.
+        *   `'media'`: Files found in the local media directory.
+    *   `status`: Tracks the lifecycle of a file entry.
+        *   `'active'`: The file is currently detected in the specified `source` category.
+        *   `'marked_for_deletion'`: User has marked this file for cleanup (future feature).
+        *   `'deleted'`: The file has been confirmed as deleted (future feature).
+        *   **Behavior**: When a file is detected during a scan, if it already exists in the database for that `source`, its `status` is updated to `'active'`, its `last_seen_at` timestamp is refreshed. New file entries automatically default to `'active' `.
+    *   `consecutive_scans`: An integer count of how many back-to-back scans have identified this file in the given `source` and `path`.
+        *   **Behavior**: If a file is found in one scan, its `consecutive_scans` is 1 (for new entries) or incremented (for existing entries). If it's *not* found in a subsequent scan (e.g., an orphaned file is deleted or added to Deluge), this counter would implicitly stop incrementing for that specific record, and a new record might be created if it appears in a different `source` category, or it might simply not be listed in that scan's results for that original `source`.
+    *   `first_seen_at` / `last_seen_at`: Timestamps for when the file was first and most recently detected under that specific `path` and `source`.
+    *   `include_in_report`: A boolean indicating if the file should be part of standard reporting (primarily for orphaned files).
+*   **`file_scan_history`**: Links files from `orphaned_files` to specific scans in `scan_results`, recording the `source` context for that file in that particular scan.
+*   **`file_hashes`**: Caches MD5 hashes of files to speed up subsequent scans.
+
+This SQLite backend replaces the previous single JSON output file as the primary data store, though a JSON report can still be generated. The database allows for more detailed historical analysis and is foundational for planned features like managing the deletion lifecycle of orphaned files.
 
 ## Performance Considerations
 

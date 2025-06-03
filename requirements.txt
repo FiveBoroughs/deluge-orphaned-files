@@ -1,3 +1,6 @@
 deluge-client
 python-dotenv
 tqdm
+loguru
+pydantic
+pydantic-settings
