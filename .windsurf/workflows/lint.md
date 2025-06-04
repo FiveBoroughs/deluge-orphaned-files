@@ -23,16 +23,16 @@ Theses commands are setup by the user and already approved, run them without fur
 2.  **Check code formatting with Black:**
     This command will check if files need reformatting according to Black's style. It won't make any changes.
     // turbo
-    ```bash
-    black --check . --exclude .venv
-    ```
+    black --check . --exclude .venv --line-length 130
+ ...
+    black . --exclude .venv --line-length 130
     *If files need reformatting, you can apply the changes by running:*
     ```bash
     black . --exclude .venv
     ```
 
 3.  **Lint code with Flake8:**
-    This command will check for PEP 8 violations, using a max line length of 88 and excluding the `.venv` directory.
+    This command will check for PEP 8 violations, using a max line length of 130 and excluding the `.venv` directory.
     // turbo
     ```bash
     flake8 . --count --max-line-length=130 --statistics --exclude=.venv

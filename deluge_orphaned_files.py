@@ -237,163 +237,173 @@ def init_sqlite_cache(db_path):
     - file_scan_history: For tracking file presence in each scan
     """
     db_exists = os.path.exists(db_path)
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
     if not db_exists:
-        logger.trace(f"Creating SQLite database at {db_path}")
+        logger.trace(f"SQLite database will be created at {db_path}")
 
-    # Create file_hashes table for caching
-    logger.trace("Ensuring 'file_hashes' table exists in the SQLite cache.")
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS file_hashes (
-        file_hash TEXT NOT NULL,
-        folder_path TEXT NOT NULL,
-        relative_path TEXT NOT NULL,
-        mtime REAL NOT NULL,
-        file_size INTEGER NOT NULL,
-        PRIMARY KEY (folder_path, relative_path)
-    );
-    """
-    )
-    # Create index on folder_path for faster lookups
-    cursor.execute(
-        """
-    CREATE INDEX IF NOT EXISTS idx_file_hashes_folder_path ON file_hashes (folder_path);
-    """
-    )
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
 
-    # Create scan_results table for storing scan metadata
-    logger.trace("Ensuring 'scan_results' table exists.")
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS scan_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        host TEXT NOT NULL,
-        base_path TEXT NOT NULL,
-        scan_start TEXT NOT NULL,
-        scan_end TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """
-    )
+            # Create file_hashes table for caching
+            logger.trace("Ensuring 'file_hashes' table exists in the SQLite cache.")
+            cursor.execute(
+                """
+            CREATE TABLE IF NOT EXISTS file_hashes (
+                file_hash TEXT NOT NULL,
+                folder_path TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                mtime REAL NOT NULL,
+                file_size INTEGER NOT NULL,
+                PRIMARY KEY (folder_path, relative_path)
+            );
+            """
+            )
+            # Create index on folder_path for faster lookups
+            cursor.execute(
+                """
+            CREATE INDEX IF NOT EXISTS idx_file_hashes_folder_path ON file_hashes (folder_path);
+            """
+            )
 
-    # Create orphaned_files table for tracking orphaned files
-    logger.trace("Ensuring 'orphaned_files' table exists.")
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS orphaned_files (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_hash TEXT NOT NULL,
-        path TEXT NOT NULL,
-        source TEXT NOT NULL,  -- 'local_torrent_folder', 'torrents', or 'media'
-        label TEXT,            -- NULL for files not from torrents
-        size INTEGER NOT NULL,
-        size_human TEXT NOT NULL,
-        first_seen_at TIMESTAMP NOT NULL,
-        last_seen_at TIMESTAMP NOT NULL,
-        consecutive_scans INTEGER NOT NULL DEFAULT 1,
-        status TEXT NOT NULL DEFAULT 'active',  -- 'active', 'marked_for_deletion', 'deleted'
-        deletion_date TIMESTAMP,
-        include_in_report BOOLEAN NOT NULL DEFAULT 1
-    );
-    """
-    )
+            # Create scan_results table for storing scan metadata
+            logger.trace("Ensuring 'scan_results' table exists.")
+            cursor.execute(
+                """
+            CREATE TABLE IF NOT EXISTS scan_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host TEXT NOT NULL,
+                base_path TEXT NOT NULL,
+                scan_start TEXT NOT NULL,
+                scan_end TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+            )
 
-    # Create file_scan_history table for tracking file presence in each scan
-    logger.trace("Ensuring 'file_scan_history' table exists.")
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS file_scan_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        scan_id INTEGER NOT NULL,
-        file_id INTEGER NOT NULL,
-        source TEXT NOT NULL,  -- 'local_torrent_folder', 'torrents', or 'media'
-        FOREIGN KEY (scan_id) REFERENCES scan_results(id),
-        FOREIGN KEY (file_id) REFERENCES orphaned_files(id)
-    );
-    """
-    )
+            # Create orphaned_files table for tracking orphaned files
+            logger.trace("Ensuring 'orphaned_files' table exists.")
+            cursor.execute(
+                """
+            CREATE TABLE IF NOT EXISTS orphaned_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_hash TEXT NOT NULL,
+                path TEXT NOT NULL,
+                source TEXT NOT NULL,  -- 'local_torrent_folder', 'torrents', or 'media'
+                label TEXT,            -- NULL for files not from torrents
+                size INTEGER NOT NULL,
+                size_human TEXT NOT NULL,
+                first_seen_at TIMESTAMP NOT NULL,
+                last_seen_at TIMESTAMP NOT NULL,
+                consecutive_scans INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active',  -- 'active', 'marked_for_deletion', 'deleted'
+                deletion_date TIMESTAMP,
+                include_in_report BOOLEAN NOT NULL DEFAULT 1
+            );
+            """
+            )
 
-    # Create indexes for faster queries on file_scan_history
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_fsh_scan_id ON file_scan_history (scan_id);"
-    )
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_fsh_file_id ON file_scan_history (file_id);"
-    )
+            # Create file_scan_history table for tracking file presence in each scan
+            logger.trace("Ensuring 'file_scan_history' table exists.")
+            cursor.execute(
+                """
+            CREATE TABLE IF NOT EXISTS file_scan_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                source TEXT NOT NULL,  -- 'local_torrent_folder', 'torrents', or 'media'
+                FOREIGN KEY (scan_id) REFERENCES scan_results(id),
+                FOREIGN KEY (file_id) REFERENCES orphaned_files(id)
+            );
+            """
+            )
 
-    # Create the view for detailed scan files from the LATEST scan
-    logger.trace("Ensuring 'vw_latest_scan_report' view exists.")
-    cursor.execute(
-        """
-    DROP VIEW IF EXISTS vw_detailed_scan_files;
-    -- Drop old view if it exists under the old name
-    """
-    )
-    cursor.execute(
-        """
-    DROP VIEW IF EXISTS vw_latest_scan_report;
-    -- Drop view if it exists to ensure it's updated
-    """
-    )
-    cursor.execute(
-        """
-    CREATE VIEW vw_latest_scan_report AS
-    SELECT
-        sr.id AS scan_id,
-        sr.host AS scan_host,
-        sr.base_path AS scan_base_path,
-        sr.scan_start,
-        sr.scan_end,
-        sr.created_at AS scan_created_at,
-        of.id AS file_id,
-        of.path AS file_path,
-        of.label AS file_label,
-        of.size AS file_size,
-        of.size_human AS file_size_human,
-        fsh.source AS scan_context_file_source,
-        -- Source specific to this file in this scan context
-        of.status AS file_status,
-        of.consecutive_scans AS file_consecutive_scans, -- Added this line
-        of.file_hash
-    FROM scan_results sr
-    JOIN file_scan_history fsh ON sr.id = fsh.scan_id
-    JOIN orphaned_files of ON fsh.file_id = of.id
-    WHERE sr.id = (SELECT id FROM scan_results ORDER BY created_at DESC LIMIT 1);
-    """
-    )
+            # Create indexes for faster queries on file_scan_history
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fsh_scan_id ON file_scan_history (scan_id);"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fsh_file_id ON file_scan_history (file_id);"
+            )
 
-    conn.commit()
-    conn.close()
-    logger.info("SQLite cache initialized successfully.")
+            logger.trace("Ensuring 'vw_latest_scan_report' view exists.")
+            cursor.execute(
+                """
+            DROP VIEW IF EXISTS vw_latest_scan_report;
+            -- Drop view if it exists to ensure it's updated
+            """
+            )
+            cursor.execute(
+                """
+            CREATE VIEW vw_latest_scan_report AS
+            SELECT
+                sr.id AS scan_id,
+                sr.host AS scan_host,
+                sr.base_path AS scan_base_path,
+                sr.scan_start,
+                sr.scan_end,
+                sr.created_at AS scan_created_at,
+                of.id AS file_id,
+                of.path AS file_path,
+                of.label AS file_label,
+                of.size AS file_size,
+                of.size_human AS file_size_human,
+                fsh.source AS scan_context_file_source,
+                -- Source specific to this file in this scan context
+                of.status AS file_status,
+                of.consecutive_scans AS file_consecutive_scans, -- Added this line
+                of.file_hash
+            FROM scan_results sr
+            JOIN file_scan_history fsh ON sr.id = fsh.scan_id
+            JOIN orphaned_files of ON fsh.file_id = of.id
+            WHERE sr.id = (SELECT id FROM scan_results ORDER BY created_at DESC LIMIT 1);
+            """
+            )
+            # The 'with' statement handles commit implicitly on success
+        logger.info("SQLite cache schema (tables and main view) initialized/verified successfully.")
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error during schema initialization (tables/main view) in {db_path}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during schema initialization (tables/main view) in {db_path}: {e}")
+        raise
 
-    # Create view for files eligible for deletion
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    logger.debug("Ensuring 'view_files_eligible_for_deletion' view exists.")
-    cursor.execute(
-        """
-    CREATE VIEW IF NOT EXISTS view_files_eligible_for_deletion AS
-    SELECT
-        of.id,
-        of.path,
-        of.source,
-        of.label,
-        of.size,
-        of.status,
-        of.first_seen_at,
-        of.last_seen_at,
-        of.consecutive_scans
-    FROM orphaned_files of
-    WHERE of.status = 'active'
-      AND julianday(of.last_seen_at) - julianday(of.first_seen_at) > 15;
-    """
-    )
-    conn.commit()
-    conn.close()
-    logger.trace("'view_files_eligible_for_deletion' view created/verified.")
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            logger.debug("Ensuring 'view_files_eligible_for_deletion' view exists.")
+            # Ensure the old view name is dropped if it exists
+            cursor.execute(
+                """
+            DROP VIEW IF EXISTS view_files_eligible_for_deletion;
+            """
+            )
+            # Recreate the view with the potentially updated definition
+            cursor.execute(
+                """
+            CREATE VIEW view_files_eligible_for_deletion AS
+            SELECT
+                of.id AS file_id,
+                of.path AS file_path,
+                of.size_human AS file_size,
+                of.first_seen_at,
+                of.last_seen_at,
+                of.consecutive_scans,
+                julianday(of.last_seen_at) - julianday(of.first_seen_at) AS days_seen_difference
+            FROM orphaned_files of
+            WHERE
+                of.source = 'local_torrent_folder' 
+                AND of.status = 'active'
+                AND of.consecutive_scans > 7 
+                AND (julianday(of.last_seen_at) - julianday(of.first_seen_at)) > 7;
+            """
+            )
+        logger.trace("'view_files_eligible_for_deletion' view created/verified.")
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error creating 'view_files_eligible_for_deletion' in {db_path}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error creating 'view_files_eligible_for_deletion' in {db_path}: {e}")
+        raise
     return True
 
 
@@ -418,32 +428,42 @@ def load_hashes_from_sqlite(
         return cache
 
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            logger.trace(f"Querying SQLite cache for folder: {str(folder_path)}")
+            cursor.execute(
+                """
+                SELECT relative_path, file_hash, mtime, file_size
+                FROM file_hashes
+                WHERE folder_path = ?;
+                """,
+                (str(folder_path),),
+            )
+            for row in cursor.fetchall():
+                relative_path, file_hash, mtime, file_size = row
+                cache[relative_path] = {
+                    "hash": file_hash,
+                    "mtime": mtime,
+                    "size": file_size,
+                }
+        # 'with' statement handles conn.close() automatically
 
-        # Query for all entries matching the folder_path
-        cursor.execute(
-            """
-        SELECT relative_path, file_hash, mtime, file_size
-        FROM file_hashes
-        WHERE folder_path = ?
-        """,
-            (str(folder_path),),
+    except sqlite3.Error as e:
+        logger.error(
+            f"SQLite error loading hashes for {str(folder_path)} from {db_path}: {e}"
+        )
+    except Exception as e:
+        logger.error(
+            f"Unexpected error loading hashes for {str(folder_path)} from {db_path}: {e}"
         )
 
-        rows = cursor.fetchall()
-
-        for relative_path, file_hash, mtime, file_size in rows:
-            cache[relative_path] = {"hash": file_hash, "mtime": mtime}
-
-        conn.close()
-        logger.debug(f"Loaded {len(cache)} entries from SQLite cache for {folder_path}")
-
-    except Exception as e:
-        logger.error(f"Error loading from SQLite cache: {str(e)}")
-
+    if not cache:
+        logger.trace(f"No cache entries found for {str(folder_path)} in {db_path}")
+    else:
+        logger.trace(
+            f"Loaded {len(cache)} cache entries for {str(folder_path)} from {db_path}"
+        )
     return cache
-
 
 def upsert_hash_to_sqlite(
     db_path: str,
@@ -468,26 +488,29 @@ def upsert_hash_to_sqlite(
         bool: True if the operation was successful, False otherwise
     """
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-
-        # Use INSERT OR REPLACE to handle both insert and update cases
-        cursor.execute(
-            """
-        INSERT OR REPLACE INTO file_hashes
-        (file_hash, folder_path, relative_path, mtime, file_size)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-            (file_hash, str(folder_path), relative_path, mtime, file_size),
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO file_hashes
+                (file_hash, folder_path, relative_path, mtime, file_size)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (file_hash, str(folder_path), relative_path, mtime, file_size),
+            )
+        logger.trace(
+            f"Upserted hash for {relative_path} in {str(folder_path)} into SQLite."
         )
-
-        conn.commit()
-        conn.close()
-        logger.trace(f"Upserted hash for {relative_path} in {folder_path} into SQLite.")
         return True
-
+    except sqlite3.Error as e:
+        logger.error(
+            f"SQLite error upserting hash for {relative_path} in {str(folder_path)}: {e}"
+        )
+        return False
     except Exception as e:
-        logger.error(f"Error upserting to SQLite cache: {str(e)}")
+        logger.error(
+            f"Unexpected error upserting hash for {relative_path} in {str(folder_path)}: {e}"
+        )
         return False
 
 
@@ -750,26 +773,26 @@ def get_local_files(
 
     if use_sqlite and sqlite_updates_batch:
         try:
-            conn = sqlite3.connect(str(config.sqlite_cache_path))
-            cursor = conn.cursor()
-            conn.execute("BEGIN TRANSACTION")
-            cursor.executemany(
-                ("INSERT OR REPLACE INTO file_hashes "
-                 "(file_hash, folder_path, relative_path, mtime, file_size) "
-                 "VALUES (?, ?, ?, ?, ?)"),
-                sqlite_updates_batch,
-            )
-            conn.commit()
+            # The 'with' statement handles BEGIN TRANSACTION, commit/rollback, and close automatically.
+            with sqlite3.connect(str(config.sqlite_cache_path)) as conn:
+                cursor = conn.cursor()  # We still need a cursor for executemany
+                cursor.executemany(
+                    ("INSERT OR REPLACE INTO file_hashes "
+                     "(file_hash, folder_path, relative_path, mtime, file_size) "
+                     "VALUES (?, ?, ?, ?, ?)"),
+                    sqlite_updates_batch,
+                )
             logger.info(
                 f"Saved/Updated {len(sqlite_updates_batch)} entries in SQLite hash cache for {Path(folder).name}."
             )
-        except Exception as e:
+        except sqlite3.Error as e:  # Catch specific SQLite errors
             logger.error(
-                f"Error batch saving to SQLite hash cache for {Path(folder).name}: {e}"
+                f"SQLite error during batch saving to hash cache for {Path(folder).name}: {e}"
             )
-        finally:
-            if conn:
-                conn.close()
+        except Exception as e:  # Catch other potential unexpected errors
+            logger.error(
+                f"Unexpected error during batch saving to SQLite hash cache for {Path(folder).name}: {e}"
+            )
 
     logger.info(
         f"Finished scanning {Path(folder).name}. Calculated {new_hashes_calculated_count} new hashes. "
