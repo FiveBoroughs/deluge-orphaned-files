@@ -23,5 +23,9 @@ Thumbs.db
 # Ignore IDE-specific files
 .vscode/
 .idea/
+
+# Ignore comparison results
 comparison_results.txt
+
+# Ignore database
 deluge_orphaned_files.db
