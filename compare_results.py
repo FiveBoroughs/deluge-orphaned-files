@@ -12,9 +12,7 @@ import logging
 from dotenv import load_dotenv
 
 # Set up logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -26,30 +24,18 @@ load_dotenv()
 # Get the local torrent folder path from environment variable
 LOCAL_TORRENT_BASE_LOCAL_FOLDER = os.getenv("LOCAL_TORRENT_BASE_LOCAL_FOLDER")
 if LOCAL_TORRENT_BASE_LOCAL_FOLDER:
-    logger.info(
-        (
-            f"Found LOCAL_TORRENT_BASE_LOCAL_FOLDER in .env: "
-            f"{LOCAL_TORRENT_BASE_LOCAL_FOLDER}"
-        )
-    )
+    logger.info((f"Found LOCAL_TORRENT_BASE_LOCAL_FOLDER in .env: " f"{LOCAL_TORRENT_BASE_LOCAL_FOLDER}"))
 else:
     logger.warning("LOCAL_TORRENT_BASE_LOCAL_FOLDER not found in environment variables")
 
 # Set the database path based on the environment variable
 if LOCAL_TORRENT_BASE_LOCAL_FOLDER:
-    DEFAULT_SQLITE_PATH = os.path.join(
-        os.path.dirname(LOCAL_TORRENT_BASE_LOCAL_FOLDER), ".file_cache.sqlite"
-    )
+    DEFAULT_SQLITE_PATH = os.path.join(os.path.dirname(LOCAL_TORRENT_BASE_LOCAL_FOLDER), ".file_cache.sqlite")
     logger.info(f"Using database path from .env: {DEFAULT_SQLITE_PATH}")
 else:
     # Fallback to a default location
     DEFAULT_SQLITE_PATH = ".file_cache.sqlite"
-    logger.warning(
-        (
-            f"LOCAL_TORRENT_BASE_LOCAL_FOLDER not found in .env, "
-            f"using default database path: {DEFAULT_SQLITE_PATH}"
-        )
-    )
+    logger.warning((f"LOCAL_TORRENT_BASE_LOCAL_FOLDER not found in .env, " f"using default database path: {DEFAULT_SQLITE_PATH}"))
 
 
 def load_json_results(json_path):
@@ -82,15 +68,9 @@ def get_sql_results(db_path):
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        cursor.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='view' AND name='vw_latest_scan_report'"
-        )
+        cursor.execute("SELECT name FROM sqlite_master " "WHERE type='view' AND name='vw_latest_scan_report'")
         if not cursor.fetchone():
-            logger.error(
-                "'vw_latest_scan_report' view not found. "
-                "Run the main script to initialize/update the DB."
-            )
+            logger.error("'vw_latest_scan_report' view not found. " "Run the main script to initialize/update the DB.")
             sys.exit(1)
 
         # Get all data from the latest scan using the view
@@ -107,10 +87,7 @@ def get_sql_results(db_path):
         conn.close()
 
         if not all_rows_from_view:
-            logger.warning(
-                "vw_latest_scan_report is empty. "
-                "This might mean no scans exist or the latest scan had no files."
-            )
+            logger.warning("vw_latest_scan_report is empty. " "This might mean no scans exist or the latest scan had no files.")
             # Return an empty structure consistent with what compare_results expects
             return {
                 "host": "N/A",
@@ -166,10 +143,7 @@ def get_sql_results(db_path):
         return result_dict
     except sqlite3.OperationalError as e:
         logger.error(f"SQLite operational error: {e}")
-        logger.error(
-            "This might indicate an issue with 'vw_latest_scan_report' "
-            "or the underlying tables."
-        )
+        logger.error("This might indicate an issue with 'vw_latest_scan_report' " "or the underlying tables.")
         sys.exit(1)
     except Exception as e:
         logger.error(f"Error getting SQL results: {e}")
@@ -180,14 +154,8 @@ def compare_results(json_data, sql_data, output_file=None):
     """Compare JSON and SQL results and report differences with detailed logging."""
     output = []
     output.append("\n=== COMPARISON RESULTS ===\n")
-    output.append(
-        f"JSON scan time: {json_data.get('scan_start', 'N/A')} "
-        f"to {json_data.get('scan_end', 'N/A')}"
-    )
-    output.append(
-        f"SQL scan time: {sql_data.get('scan_start', 'N/A')} "
-        f"to {sql_data.get('scan_end', 'N/A')}"
-    )
+    output.append(f"JSON scan time: {json_data.get('scan_start', 'N/A')} " f"to {json_data.get('scan_end', 'N/A')}")
+    output.append(f"SQL scan time: {sql_data.get('scan_start', 'N/A')} " f"to {sql_data.get('scan_end', 'N/A')}")
     output.append(f"JSON host: {json_data.get('host', 'N/A')}")
     output.append(f"SQL host: {sql_data.get('host', 'N/A')}")
     output.append(f"JSON base path: {json_data.get('base_path', 'N/A')}")
@@ -243,18 +211,14 @@ def compare_results(json_data, sql_data, output_file=None):
         if missing_in_sql_paths:
             category_has_differences = True
             any_differences_found = True
-            output.append(
-                f"  Files in JSON but not in SQL ({len(missing_in_sql_paths)}):"
-            )
+            output.append(f"  Files in JSON but not in SQL ({len(missing_in_sql_paths)}):")
             for path in sorted(list(missing_in_sql_paths)):
                 output.append(f"    - {path}")
 
         if missing_in_json_paths:
             category_has_differences = True
             any_differences_found = True
-            output.append(
-                f"  Files in SQL but not in JSON ({len(missing_in_json_paths)}):"
-            )
+            output.append(f"  Files in SQL but not in JSON ({len(missing_in_json_paths)}):")
             for path in sorted(list(missing_in_json_paths)):
                 output.append(f"    - {path}")
 
@@ -286,14 +250,9 @@ def compare_results(json_data, sql_data, output_file=None):
                     attribute_mismatches_details.append(f"      - {mismatch_detail}")
 
         if attribute_mismatches_details:
-            output.append(
-                f"  Attribute mismatches for common files "
-                f"({category_attribute_mismatches}):"
-            )
+            output.append(f"  Attribute mismatches for common files " f"({category_attribute_mismatches}):")
             output.extend(attribute_mismatches_details)
-            overall_summary[
-                "total_attribute_mismatches"
-            ] += category_attribute_mismatches
+            overall_summary["total_attribute_mismatches"] += category_attribute_mismatches
 
         if not category_has_differences:
             output.append("  No differences found in this category.")
@@ -302,30 +261,17 @@ def compare_results(json_data, sql_data, output_file=None):
     output.append("\n\n=== OVERALL SUMMARY ===\n")
     output.append(f"Total files in JSON: {overall_summary['total_json_files']}")
     output.append(f"Total files in SQL: {overall_summary['total_sql_files']}")
-    output.append(
-        f"Total files in JSON but not in SQL: {overall_summary['total_missing_in_sql']}"
-    )
-    output.append(
-        f"Total files in SQL but not in JSON: "
-        f"{overall_summary['total_missing_in_json']}"
-    )
-    output.append(
-        f"Total common files checked for attributes: "
-        f"{overall_summary['total_common_files_checked']}"
-    )
-    output.append(
-        f"Total attribute mismatches in common files: "
-        f"{overall_summary['total_attribute_mismatches']}"
-    )
+    output.append(f"Total files in JSON but not in SQL: {overall_summary['total_missing_in_sql']}")
+    output.append(f"Total files in SQL but not in JSON: " f"{overall_summary['total_missing_in_json']}")
+    output.append(f"Total common files checked for attributes: " f"{overall_summary['total_common_files_checked']}")
+    output.append(f"Total attribute mismatches in common files: " f"{overall_summary['total_attribute_mismatches']}")
 
     if not any_differences_found:
         output.append("\nCONCLUSION: JSON and SQL results are IDENTICAL.")
         logger.info("Comparison complete: JSON and SQL results are identical.")
     else:
         output.append("\nCONCLUSION: Differences found between JSON and SQL results.")
-        logger.warning(
-            "Comparison complete: Differences found. Check the output for details."
-        )
+        logger.warning("Comparison complete: Differences found. Check the output for details.")
 
     if output_file:
         try:
@@ -344,12 +290,8 @@ def compare_results(json_data, sql_data, output_file=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Compare orphaned_files.json with SQL database results"
-    )
-    parser.add_argument(
-        "--json_path", default=DEFAULT_JSON_PATH, help="Path to the JSON results file"
-    )
+    parser = argparse.ArgumentParser(description="Compare orphaned_files.json with SQL database results")
+    parser.add_argument("--json_path", default=DEFAULT_JSON_PATH, help="Path to the JSON results file")
     parser.add_argument(
         "--db_path",
         default=DEFAULT_SQLITE_PATH,

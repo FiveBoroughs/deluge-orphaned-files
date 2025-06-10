@@ -5,7 +5,7 @@ trigger: always_on
 Always use the Virtualenv in .venv
 Always use the --no-progress arg when running the script to limit ouput
 Use English for all code and documentation
-Follow PEP 8 style guide with Black formatter (line length: 130 characters)
+Follow PEP 8 style guide with Black formatter (line length: 200 characters)
 Use type hints for all functions (parameters and return values)
 Avoid using any type; create specific types when needed
 Use docstrings for all public classes and methods (Google style)
