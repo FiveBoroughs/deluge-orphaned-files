@@ -63,10 +63,10 @@ def get_sql_results(db_path):
             logger.error(f"Database file not found: {db_path}")
             sys.exit(1)
 
-        conn = sqlite3.connect(db_path)
-        # Use row_factory to access columns by name, useful for fetching metadata
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        with sqlite3.connect(db_path) as conn:
+            # Use row_factory to access columns by name, useful for fetching metadata
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
 
         cursor.execute("SELECT name FROM sqlite_master " "WHERE type='view' AND name='vw_latest_scan_report'")
         if not cursor.fetchone():
@@ -107,11 +107,7 @@ def get_sql_results(db_path):
         scan_end = first_row["scan_end"]
         latest_scan_id = first_row["scan_id"]  # For logging purposes
 
-        logger.info(
-            f"Successfully retrieved {len(all_rows_from_view)} files "
-            f"from the latest scan (ID: {latest_scan_id}) "
-            f"using vw_latest_scan_report"
-        )
+        logger.info(f"Successfully retrieved {len(all_rows_from_view)} files " f"from the latest scan (ID: {latest_scan_id}) " f"using vw_latest_scan_report")
 
         result_dict = {
             "host": host,

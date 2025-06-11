@@ -27,12 +27,7 @@ logger.remove()  # Remove default stderr logger
 logger.add(
     sys.stdout,
     level="INFO",
-    format=(
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-        "<level>{message}</level>"
-    ),
+    format=("<green>{time:YYYY-MM-DD HH:mm:ss}</green> | " "<level>{level: <8}</level> | " "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - " "<level>{message}</level>"),
 )
 logger.add(
     log_file_path,
@@ -45,7 +40,6 @@ logger.add(
 logger.info(f"Logging initialized. Log file: {log_file_path}")
 
 
-# --- Pydantic Configuration Model ---
 class AppConfig(BaseSettings):
     # Required fields (Pydantic raises error if alias not found in environment)
     deluge_host: str = Field(alias="DELUGE_HOST")
@@ -107,22 +101,16 @@ class AppConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _populate_parsed_lists(self) -> "AppConfig":
-        default_ext_str = (
-            ".nfo,.srt,.jpg,.sfv,.txt,.png,.sub,.torrent,.plexmatch," ".m3u,.json,.webp,.jpeg,.obj,.ini,.dtshd,.invalid"
-        )
+        default_ext_str = ".nfo,.srt,.jpg,.sfv,.txt,.png,.sub,.torrent,.plexmatch," ".m3u,.json,.webp,.jpeg,.obj,.ini,.dtshd,.invalid"
         default_sub_str = "music,ebooks,courses"
 
-        effective_ext_str = (
-            self.raw_extensions_blacklist_str if self.raw_extensions_blacklist_str is not None else default_ext_str
-        )
+        effective_ext_str = self.raw_extensions_blacklist_str if self.raw_extensions_blacklist_str is not None else default_ext_str
         if isinstance(effective_ext_str, str):
-            self.extensions_blacklist = [item.strip() for item in effective_ext_str.split(",") if item.strip()]
+            self.extensions_blacklist = [item.strip().lower() for item in effective_ext_str.split(",") if item.strip()]
         else:  # Should not happen if default_ext_str is used
             self.extensions_blacklist = []
 
-        effective_sub_str = (
-            self.raw_local_subfolders_blacklist_str if self.raw_local_subfolders_blacklist_str is not None else default_sub_str
-        )
+        effective_sub_str = self.raw_local_subfolders_blacklist_str if self.raw_local_subfolders_blacklist_str is not None else default_sub_str
         if isinstance(effective_sub_str, str):
             self.local_subfolders_blacklist = [item.strip() for item in effective_sub_str.split(",") if item.strip()]
         else:  # Should not happen if default_sub_str is used
@@ -152,7 +140,7 @@ def print_version_info():
 
 
 # The verify_paths() function has been removed as its logic is now in validate_env_config().
-# Ensure to remove any calls to verify_paths() from your main() function or elsewhere.
+
 
 # Helper function to check if file should be processed
 
@@ -173,12 +161,7 @@ def should_process_file(filepath: Path, stat_result: os.stat_result) -> bool:
     # Check minimum file size
     min_size_bytes = config.min_file_size_mb * 1024 * 1024
     if stat_result.st_size < min_size_bytes:
-        logger.trace(
-            (
-                f"Skipping {filepath.name} due to size: {stat_result.st_size} bytes "
-                f"< {min_size_bytes} bytes ({config.min_file_size_mb} MB)"
-            )
-        )
+        logger.trace((f"Skipping {filepath.name} due to size: {stat_result.st_size} bytes " f"< {min_size_bytes} bytes ({config.min_file_size_mb} MB)"))
         return False
 
     return True
@@ -204,7 +187,6 @@ def init_sqlite_cache(db_path):
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
 
-            # Create file_hashes table for caching
             logger.trace("Ensuring 'file_hashes' table exists in the SQLite cache.")
             cursor.execute(
                 """
@@ -218,14 +200,13 @@ def init_sqlite_cache(db_path):
             );
             """
             )
-            # Create index on folder_path for faster lookups
+
             cursor.execute(
                 """
             CREATE INDEX IF NOT EXISTS idx_file_hashes_folder_path ON file_hashes (folder_path);
             """
             )
 
-            # Create scan_results table for storing scan metadata
             logger.trace("Ensuring 'scan_results' table exists.")
             cursor.execute(
                 """
@@ -240,7 +221,6 @@ def init_sqlite_cache(db_path):
             """
             )
 
-            # Create orphaned_files table for tracking orphaned files
             logger.trace("Ensuring 'orphaned_files' table exists.")
             cursor.execute(
                 """
@@ -263,7 +243,6 @@ def init_sqlite_cache(db_path):
             """
             )
 
-            # Create file_scan_history table for tracking file presence in each scan
             logger.trace("Ensuring 'file_scan_history' table exists.")
             cursor.execute(
                 """
@@ -278,7 +257,6 @@ def init_sqlite_cache(db_path):
             """
             )
 
-            # Create indexes for faster queries on file_scan_history
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_fsh_scan_id ON file_scan_history (scan_id);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_fsh_file_id ON file_scan_history (file_id);")
 
@@ -315,7 +293,7 @@ def init_sqlite_cache(db_path):
             WHERE sr.id = (SELECT id FROM scan_results ORDER BY created_at DESC LIMIT 1);
             """
             )
-            # The 'with' statement handles commit implicitly on success
+
         logger.info("SQLite cache schema (tables and main view) initialized/verified successfully.")
     except sqlite3.Error as e:
         logger.error(f"SQLite error during schema initialization (tables/main view) in {db_path}: {e}")
@@ -328,13 +306,15 @@ def init_sqlite_cache(db_path):
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
             logger.debug("Ensuring 'view_files_eligible_for_deletion' view exists.")
-            # Ensure the old view name is dropped if it exists
+
             cursor.execute(
                 """
             DROP VIEW IF EXISTS view_files_eligible_for_deletion;
             """
             )
-            # Recreate the view with the potentially updated definition
+
+            # SQLite doesn't allow parameters in view definitions, so we need to use string formatting
+            # This is safe because we're using configuration values, not user input
             create_view_sql = f"""
             CREATE VIEW view_files_eligible_for_deletion AS
             SELECT
@@ -349,27 +329,26 @@ def init_sqlite_cache(db_path):
             WHERE
                 of.source = 'local_torrent_folder'
                 AND of.status = 'active'
-                AND of.consecutive_scans > {config.deletion_consecutive_scans_threshold}
-                AND (julianday(of.last_seen_at) - julianday(of.first_seen_at)) > {config.deletion_days_threshold};
+                AND of.consecutive_scans >= {config.deletion_consecutive_scans_threshold}
+                AND (julianday(of.last_seen_at) - julianday(of.first_seen_at)) >= {config.deletion_days_threshold};
             """
             cursor.execute(create_view_sql)
         logger.trace("'view_files_eligible_for_deletion' view created/verified.")
     except sqlite3.Error as e:
         logger.error(f"SQLite error creating 'view_files_eligible_for_deletion' in {db_path}: {e}")
-        # Do not raise here, allow other view creations to proceed if possible or handle at a higher level
+
     except Exception as e:
         logger.error(f"Unexpected error creating 'view_files_eligible_for_deletion' in {db_path}: {e}")
-        # Do not raise here
 
     try:
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
             logger.debug("Ensuring 'vw_autoremove_candidates_latest_scan' view exists.")
             cursor.execute("DROP VIEW IF EXISTS vw_autoremove_candidates_latest_scan;")
-            # The target_label_prefix is dynamic, so we use a placeholder and f-string.
-            # This is generally safe here as it's developer-controlled, not direct user input.
-            # However, for broader applications, parameterized queries or more robust escaping would be advised if the prefix could be arbitrary.
-            target_label_prefix_for_sql = config.deluge_autoremove_label  # Assuming this exists in config, or use a default
+
+            # SQLite doesn't allow parameters in view definitions, so we need to use string formatting
+            # This is safe because we're using configuration values, not user input
+            target_label_prefix_for_sql = config.deluge_autoremove_label.lower()
             create_autoremove_view_sql = f"""
             CREATE VIEW vw_autoremove_candidates_latest_scan AS
             SELECT
@@ -387,7 +366,7 @@ def init_sqlite_cache(db_path):
                 AND of.torrent_id IS NOT NULL
                 AND (
                     of.label IS NULL
-                    OR NOT INSTR(LOWER(of.label), LOWER('{target_label_prefix_for_sql}')) > 0
+                    OR NOT INSTR(LOWER(of.label), '{target_label_prefix_for_sql}') > 0
                 );
             """
             cursor.execute(create_autoremove_view_sql)
@@ -437,7 +416,6 @@ def load_hashes_from_sqlite(db_path: str, folder_path: Path) -> Dict[str, Dict[s
                     "mtime": mtime,
                     "size": file_size,
                 }
-        # 'with' statement handles conn.close() automatically
 
     except sqlite3.Error as e:
         logger.error(f"SQLite error loading hashes for {str(folder_path)} from {db_path}: {e}")
@@ -494,7 +472,16 @@ def upsert_hash_to_sqlite(
         return False
 
 
-def get_deluge_files():
+def get_deluge_files() -> Tuple[set, Dict[str, str], Dict[str, str]]:
+    """
+    Connect to Deluge client and retrieve information about all torrents.
+
+    Returns:
+        Tuple[set, Dict[str, str], Dict[str, str]]: A tuple containing:
+            - set of all file paths in Deluge
+            - dictionary mapping file paths to their labels
+            - dictionary mapping file paths to their torrent IDs
+    """
     client = DelugeRPCClient(
         config.deluge_host,
         config.deluge_port,
@@ -516,24 +503,17 @@ def get_deluge_files():
         for file in torrent_data[b"files"]:
             file_path_in_torrent = file[b"path"].decode()  # Path of file *within* the torrent, relative to save_path
 
-            # Normalize path components
             norm_save_path = os.path.normpath(save_path)
-            # file_path_in_torrent is already relative, but normalize it too for safety
+
             norm_file_path_in_torrent = os.path.normpath(file_path_in_torrent)
             norm_deluge_base_remote_folder = os.path.normpath(config.deluge_torrent_base_remote_folder)
 
-            # Construct the full path of the file on the system Deluge is running on
             full_path_on_deluge_system = os.path.join(norm_save_path, norm_file_path_in_torrent)
-            # Ensure the joined path is also normalized
+
             full_path_on_deluge_system = os.path.normpath(full_path_on_deluge_system)
 
-            # Calculate the path relative to the configured base folder
             relative_path = os.path.relpath(full_path_on_deluge_system, norm_deluge_base_remote_folder)
 
-            # It's good practice to warn if the path seems to be outside the expected base
-            # This can happen if DELUGE_TORRENT_BASE_REMOTE_FOLDER is
-            # misconfigured or
-            # if a torrent's save_path is unexpectedly outside this base.
             if ".." in relative_path.split(os.path.sep):
                 logger.warning(
                     f"File '{full_path_on_deluge_system}' from torrent "
@@ -550,7 +530,17 @@ def get_deluge_files():
     return all_files, file_labels, file_torrent_ids
 
 
-def load_hash_cache(cache_file):
+def load_hash_cache(cache_file: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Load file hash cache from a JSON file.
+
+    Args:
+        cache_file (str): Path to the JSON cache file
+
+    Returns:
+        Dict[str, Dict[str, Any]]: Dictionary where keys are file paths and values are
+                                   dictionaries with 'hash', 'mtime', and 'size' fields
+    """
     logger.debug(f"Loading cache from: {cache_file}")
     if os.path.exists(cache_file):
         try:
@@ -566,7 +556,15 @@ def load_hash_cache(cache_file):
     return {}
 
 
-def save_hash_cache(cache_file, hash_cache):
+def save_hash_cache(cache_file: str, hash_cache: Dict[str, Dict[str, Any]]) -> None:
+    """
+    Save file hash cache to a JSON file.
+
+    Args:
+        cache_file (str): Path to the JSON cache file
+        hash_cache (Dict[str, Dict[str, Any]]): Dictionary where keys are file paths and values are
+                                              dictionaries with 'hash', 'mtime', and 'size' fields
+    """
     logger.debug(f"Saving {len(hash_cache)} entries to hash cache")
     try:
         with open(cache_file, "w") as f:
@@ -601,7 +599,7 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
     new_hashes_calculated_count = 0
 
     if use_sqlite:
-        # init_sqlite_cache is now called once in main()
+
         hash_cache = load_hashes_from_sqlite(str(config.sqlite_cache_path), folder)
     else:
         cache_file = Path(folder) / ".hash_cache.json"
@@ -610,21 +608,19 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
     logger.info(f"Starting pre-scan for {Path(folder).name} to collect and filter files...")
     paths_to_process_with_stats = []
     for root, dirs, files_in_dir in os.walk(folder):
-        # Prune blacklisted subdirectories early
+
         current_path = Path(root)
         relative_root_path = current_path.relative_to(folder)
 
         if relative_root_path.parts and relative_root_path.parts[0] in config.local_subfolders_blacklist:
-            logger.trace(
-                f"Skipping blacklisted directory: {Path(folder) / relative_root_path.parts[0]} and all its subdirectories {dirs}."
-            )
+            logger.trace(f"Skipping blacklisted directory: {Path(folder) / relative_root_path.parts[0]} and all its subdirectories {dirs}.")
             dirs[:] = []  # Don't descend into blacklisted directories
             continue
 
         for file_name in files_in_dir:
             full_path_str = os.path.join(root, file_name)
             try:
-                stat_result = os.stat(full_path_str)  # Single stat call
+                stat_result = os.stat(full_path_str)
                 if os.path.isfile(full_path_str) and should_process_file(Path(full_path_str), stat_result):
                     paths_to_process_with_stats.append((full_path_str, stat_result))
             except FileNotFoundError:
@@ -713,36 +709,37 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
 
     if use_sqlite and sqlite_updates_batch:
         try:
-            # The 'with' statement handles BEGIN TRANSACTION, commit/rollback, and close automatically.
             with sqlite3.connect(str(config.sqlite_cache_path)) as conn:
-                cursor = conn.cursor()  # We still need a cursor for executemany
+                cursor = conn.cursor()
                 cursor.executemany(
-                    (
-                        "INSERT OR REPLACE INTO file_hashes "
-                        "(file_hash, folder_path, relative_path, mtime, file_size) "
-                        "VALUES (?, ?, ?, ?, ?)"
-                    ),
+                    ("INSERT OR REPLACE INTO file_hashes " "(file_hash, folder_path, relative_path, mtime, file_size) " "VALUES (?, ?, ?, ?, ?)"),
                     sqlite_updates_batch,
                 )
             logger.info(f"Saved/Updated {len(sqlite_updates_batch)} entries in SQLite hash cache for {Path(folder).name}.")
-        except sqlite3.Error as e:  # Catch specific SQLite errors
+        except sqlite3.Error as e:
             logger.error(f"SQLite error during batch saving to hash cache for {Path(folder).name}: {e}")
-        except Exception as e:  # Catch other potential unexpected errors
+        except Exception as e:
             logger.error(f"Unexpected error during batch saving to SQLite hash cache for {Path(folder).name}: {e}")
 
-    logger.info(
-        f"Finished scanning {Path(folder).name}. Calculated {new_hashes_calculated_count} new hashes. "
-        f"Processed {len(local_files)}/{total_eligible_files} eligible files."
-    )
+    logger.info(f"Finished scanning {Path(folder).name}. Calculated {new_hashes_calculated_count} new hashes. " f"Processed {len(local_files)}/{total_eligible_files} eligible files.")
     return local_files
 
 
 def get_file_hash(file_path: Path, no_progress: bool = False) -> str:
+    """
+    Calculate MD5 hash of a file with optional progress bar.
+
+    Args:
+        file_path (Path): Path to the file to hash
+        no_progress (bool): If True, disable progress bar
+
+    Returns:
+        str: Hexadecimal MD5 hash of the file
+    """
     md5_hash = hashlib.md5()
     file_size = os.path.getsize(file_path)
 
-    # Use a larger chunk size for better performance with large files
-    chunk_size = 1024 * 1024  # 1MB chunks instead of 8KB
+    chunk_size = 8 * 1024 * 1024
 
     logger.debug(f"Calculating MD5 hash for: {file_path}")
     with open(file_path, "rb") as f:
@@ -767,9 +764,10 @@ def find_orphaned_files(skip_media_check=False, use_sqlite=False, no_progress: b
     Args:
         skip_media_check (bool): Whether to skip checking the media folder
         use_sqlite (bool): Whether to use SQLite for caching and save results only to the database
+        no_progress (bool): Whether to disable progress bars for this scan
 
     Returns:
-        Tuple[int, List[Dict[str, Any]]]: A tuple containing the scan ID (if saved to database, otherwise 0) and the list of 'only_in_torrents' files.
+        int: The scan ID if saved to database, otherwise 0
     """
     scan_start_time = datetime.now()
     scan_id = 0
@@ -783,14 +781,11 @@ def find_orphaned_files(skip_media_check=False, use_sqlite=False, no_progress: b
         local_torrent_files = get_local_files(config.local_torrent_base_local_folder, use_sqlite, no_progress=no_progress)
         logger.info(f"Found {len(local_torrent_files)} files in local torrent folder.")
 
-        # Get orphaned files with their sizes
         orphaned_torrent_files = [
             {
                 "path": path,
                 "size": info["size"],
-                "size_human": (
-                    f"{info['size'] / (1024**3):.2f} GB" if info["size"] >= 1024**3 else f"{info['size'] / (1024**2):.2f} MB"
-                ),
+                "size_human": (f"{info['size'] / (1024**3):.2f} GB" if info["size"] >= 1024**3 else f"{info['size'] / (1024**2):.2f} MB"),
             }
             for path, info in local_torrent_files.items()
             if path not in deluge_file_paths
@@ -799,12 +794,7 @@ def find_orphaned_files(skip_media_check=False, use_sqlite=False, no_progress: b
         orphaned_torrent_files.sort(key=lambda x: x["size"], reverse=True)
 
         logger.info("Comparing files in deluge against files in the local torrent folder...")
-        logger.info(
-            (
-                f"Found {len(orphaned_torrent_files)} orphaned files in torrent folder "
-                f"(present locally, not in Deluge). Actions planned: Potential deletion after checks."
-            )
-        )
+        logger.info((f"Found {len(orphaned_torrent_files)} orphaned files in torrent folder " f"(present locally, not in Deluge). Actions planned: Potential deletion after checks."))
 
         if skip_media_check:
             if orphaned_torrent_files:
@@ -833,27 +823,18 @@ def find_orphaned_files(skip_media_check=False, use_sqlite=False, no_progress: b
             for name, info in local_torrent_files.items()
             if not any(name.startswith(subfolder + "/") for subfolder in config.local_subfolders_blacklist)
         }
-        media_hashes = {
-            info["hash"]: (name, info["size"])
-            for name, info in local_media_files.items()
-            if not any(name.startswith(subfolder + "/") for subfolder in config.local_subfolders_blacklist)
-        }
+        media_hashes = {info["hash"]: (name, info["size"]) for name, info in local_media_files.items() if not any(name.startswith(subfolder + "/") for subfolder in config.local_subfolders_blacklist)}
 
         # Pre-filter collections before set operations
         torrent_set = frozenset(torrent_hashes.keys())
         media_set = frozenset(media_hashes.keys())
 
-        # Get files only in torrents with sizes
         only_in_torrents = [
             {
                 "path": torrent_hashes[hash][0],
                 "label": torrent_hashes[hash][2],
                 "size": torrent_hashes[hash][1],
-                "size_human": (
-                    f"{torrent_hashes[hash][1] / (1024**3):.2f} GB"
-                    if torrent_hashes[hash][1] >= 1024**3
-                    else f"{torrent_hashes[hash][1] / (1024**2):.2f} MB"
-                ),
+                "size_human": (f"{torrent_hashes[hash][1] / (1024**3):.2f} GB" if torrent_hashes[hash][1] >= 1024**3 else f"{torrent_hashes[hash][1] / (1024**2):.2f} MB"),
                 "torrent_id": torrent_hashes[hash][3],
             }
             for hash in torrent_set - media_set
@@ -866,38 +847,21 @@ def find_orphaned_files(skip_media_check=False, use_sqlite=False, no_progress: b
             reverse=True,
         )
 
-        # Get files only in media with sizes
         only_in_media = [
             {
                 "path": media_hashes[hash][0],
                 "size": media_hashes[hash][1],
-                "size_human": (
-                    f"{media_hashes[hash][1] / (1024**3):.2f} GB"
-                    if media_hashes[hash][1] >= 1024**3
-                    else f"{media_hashes[hash][1] / (1024**2):.2f} MB"
-                ),
+                "size_human": (f"{media_hashes[hash][1] / (1024**3):.2f} GB" if media_hashes[hash][1] >= 1024**3 else f"{media_hashes[hash][1] / (1024**2):.2f} MB"),
             }
             for hash in media_set - torrent_set
         ]
         only_in_media.sort(key=lambda x: x["size"], reverse=True)
 
         # Save results regardless of whether orphans were found
-        logger.info(
-            (
-                f"\nScan complete. Found {len(orphaned_torrent_files)} orphans, "
-                f"{len(only_in_torrents)} files only in torrents, "
-                f"{len(only_in_media)} files only in media"
-            )
-        )
+        logger.info((f"\nScan complete. Found {len(orphaned_torrent_files)} orphans, " f"{len(only_in_torrents)} files only in torrents, " f"{len(only_in_media)} files only in media"))
 
-        # Save to database if using SQLite, otherwise save to JSON
         if use_sqlite:
-            # save_scan_results_to_db returns (scan_id, original_only_in_torrents_list)
-            # We capture the scan_id. The second element of the tuple (the list)
-            # is the same 'only_in_torrents' list we passed in, so we can ignore it here.
-            # We will return the 'only_in_torrents' list from the current scope.
             scan_id_from_db, _ = save_scan_results_to_db(orphaned_torrent_files, only_in_torrents, only_in_media, scan_start_time)
-            # It's important to use scan_id_from_db as the scan_id for this branch
             return scan_id_from_db
         else:
             save_scan_results(orphaned_torrent_files, only_in_torrents, only_in_media, scan_start_time)
@@ -910,9 +874,9 @@ def find_orphaned_files(skip_media_check=False, use_sqlite=False, no_progress: b
 
 
 def save_scan_results_to_db(
-    orphaned_torrent_files: list,
-    only_in_torrents: list,
-    only_in_media: list,
+    orphaned_torrent_files: List[Dict[str, Any]],
+    only_in_torrents: List[Dict[str, Any]],
+    only_in_media: List[Dict[str, Any]],
     scan_start_time: datetime,
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """
@@ -925,32 +889,34 @@ def save_scan_results_to_db(
         scan_start_time: When the scan started
 
     Returns:
-        int: The ID of the scan record
+        Tuple[int, List[Dict[str, Any]]]: A tuple containing:
+            - The ID of the scan record
+            - List of files only in torrents with updated database IDs
     """
     scan_end_time = datetime.now()
 
     try:
-        conn = sqlite3.connect(str(config.sqlite_cache_path))
-        cursor = conn.cursor()
+        with sqlite3.connect(str(config.sqlite_cache_path)) as conn:
+            cursor = conn.cursor()
 
-        # Insert scan metadata
-        cursor.execute(
-            """
-        INSERT INTO scan_results (host, base_path, scan_start, scan_end)
-        VALUES (?, ?, ?, ?)
-        """,
-            (
-                f"{config.deluge_username}@{config.deluge_host}:{config.deluge_port}",
-                str(config.deluge_torrent_base_remote_folder),
-                scan_start_time.isoformat(),
-                scan_end_time.isoformat(),
-            ),
-        )
+            # Insert scan metadata
+            cursor.execute(
+                """
+            INSERT INTO scan_results (host, base_path, scan_start, scan_end)
+            VALUES (?, ?, ?, ?)
+            """,
+                (
+                    f"{config.deluge_username}@{config.deluge_host}:{config.deluge_port}",
+                    str(config.deluge_torrent_base_remote_folder),
+                    scan_start_time.isoformat(),
+                    scan_end_time.isoformat(),
+                ),
+            )
 
-        scan_id = cursor.lastrowid
-        logger.info(f"Created scan record with ID {scan_id}")
+            scan_id = cursor.lastrowid
+            logger.info(f"Created scan record with ID {scan_id}")
 
-        # --- Mark 'local_torrent_folder' files not found in this scan as inactive ---
+        # Mark 'local_torrent_folder' files not found in this scan as inactive
         current_source_for_orphans = "local_torrent_folder"
         cursor.execute(
             """
@@ -959,13 +925,12 @@ def save_scan_results_to_db(
             """,
             (current_source_for_orphans,),
         )
+
         active_db_orphan_files = {row[1]: row[0] for row in cursor.fetchall()}  # path: id
 
         current_disk_orphan_files_paths = set()
         for file_info_ot_pre_check in orphaned_torrent_files:
-            path_ot_pre_check = (
-                file_info_ot_pre_check["path"] if isinstance(file_info_ot_pre_check, dict) else file_info_ot_pre_check
-            )
+            path_ot_pre_check = file_info_ot_pre_check["path"] if isinstance(file_info_ot_pre_check, dict) else file_info_ot_pre_check
             current_disk_orphan_files_paths.add(path_ot_pre_check)
 
         orphans_no_longer_seen_ids = []
@@ -989,8 +954,6 @@ def save_scan_results_to_db(
                 f"Marked {len(orphans_no_longer_seen_ids)} previously active '{current_source_for_orphans}' files "
                 f"as 'inactive' (consecutive scans reset) because they were not found in scan ID {scan_id}."
             )
-            # No conn.commit() here, will be committed with other changes for this source or at the end.
-        # --- End of marking inactive orphaned files ---
 
         # Process orphaned torrent files
         for file_info in orphaned_torrent_files:
@@ -1010,34 +973,29 @@ def save_scan_results_to_db(
                 size = file_info["size"]
                 size_human = file_info["size_human"]
 
-            # Get file hash if available
             file_hash = ""
             full_path = os.path.join(str(config.local_torrent_base_local_folder), path)
             if os.path.exists(full_path):
                 try:
                     # Try to get hash from cache first
-                    conn_cache = sqlite3.connect(str(config.sqlite_cache_path))
-                    cursor_cache = conn_cache.cursor()
-                    cursor_cache.execute(
+                    cursor.execute(
                         """
-                    SELECT file_hash FROM file_hashes
-                    WHERE folder_path = ? AND relative_path = ?
-                    """,
+                        SELECT file_hash FROM file_hashes
+                        WHERE folder_path = ? AND relative_path = ?
+                        """,
                         (str(config.local_torrent_base_local_folder), path),
                     )
 
-                    result = cursor_cache.fetchone()
+                    result = cursor.fetchone()
                     if result:
                         file_hash = result[0]
-                    conn_cache.close()
-                except Exception as e:
-                    logger.error(f"Error getting file hash from cache: {str(e)}")
+                except sqlite3.Error as e:
+                    logger.error(f"Error getting file hash from cache: {e}")
 
             # Determine if this file should be included in the report
             # All orphaned torrent files are included
             include_in_report = True
 
-            # --- SECTION TO HANDLE ORPHANED FILES (found in local_torrent_folder) ---
             now_iso = datetime.now().isoformat()
             current_source = "local_torrent_folder"
 
@@ -1101,10 +1059,7 @@ def save_scan_results_to_db(
                     ),
                 )
                 file_id = cursor.lastrowid
-                logger.debug(
-                    f"Inserted new orphaned file: ID {file_id}, Path {path}, Source {current_source}. Consecutive_scans: 1. Status 'active'."
-                )
-            # --- END OF MODIFIED SECTION ---
+                logger.debug(f"Inserted new orphaned file: ID {file_id}, Path {path}, Source {current_source}. " f"Consecutive_scans: 1. Status 'active'.")
 
             # Insert into file_scan_history
             cursor.execute(
@@ -1121,25 +1076,22 @@ def save_scan_results_to_db(
             label = file_info.get("label", "none")
             size = file_info["size"]
             size_human = file_info["size_human"]
-            torrent_id = file_info.get("torrent_id")  # THE FIX
+            torrent_id = file_info.get("torrent_id")
 
             file_hash = ""
             full_path = os.path.join(str(config.local_torrent_base_local_folder), path)
             if os.path.exists(full_path):
                 try:
                     # Get hash from cache
-                    conn_cache = sqlite3.connect(str(config.sqlite_cache_path))
-                    cursor_cache = conn_cache.cursor()
-                    cursor_cache.execute(
+                    cursor.execute(
                         "SELECT file_hash FROM file_hashes WHERE folder_path = ? AND relative_path = ?",
                         (str(config.local_torrent_base_local_folder), path),
                     )
-                    result = cursor_cache.fetchone()
+                    result = cursor.fetchone()
                     if result:
                         file_hash = result[0]
-                    conn_cache.close()
-                except Exception as e:
-                    logger.error(f"Error getting file hash from cache for 'torrents' source: {str(e)}")
+                except sqlite3.Error as e:
+                    logger.error(f"Error getting file hash from cache for 'torrents' source: {e}")
 
             include_in_report = size > 100000000 and not label.startswith("other") and not label.startswith("soft")
             now_iso = datetime.now().isoformat()
@@ -1174,7 +1126,7 @@ def save_scan_results_to_db(
                         size,
                         size_human,
                         include_in_report,
-                        torrent_id,  # THE FIX
+                        torrent_id,
                         file_id,
                     ),
                 )
@@ -1196,7 +1148,7 @@ def save_scan_results_to_db(
                         now_iso,
                         now_iso,
                         include_in_report,
-                        torrent_id,  # THE FIX
+                        torrent_id,
                     ),
                 )
                 file_id = cursor.lastrowid
@@ -1220,18 +1172,15 @@ def save_scan_results_to_db(
             if os.path.exists(full_path):
                 try:
                     # Get hash from cache
-                    conn_cache = sqlite3.connect(str(config.sqlite_cache_path))
-                    cursor_cache = conn_cache.cursor()
-                    cursor_cache.execute(
+                    cursor.execute(
                         "SELECT file_hash FROM file_hashes WHERE folder_path = ? AND relative_path = ?",
                         (str(config.local_media_base_local_folder), path),
                     )
-                    result = cursor_cache.fetchone()
+                    result = cursor.fetchone()
                     if result:
                         file_hash = result[0]
-                    conn_cache.close()
-                except Exception as e:
-                    logger.error(f"Error getting file hash from cache for 'media' source: {str(e)}")
+                except sqlite3.Error as e:
+                    logger.error(f"Error getting file hash from cache for 'media' source: {e}")
 
             media_label = None
             include_in_report = True
@@ -1325,24 +1274,23 @@ def get_formatted_scan_results(scan_id=None, limit=1):
         str: Formatted scan results
     """
     try:
-        conn = sqlite3.connect(str(config.sqlite_cache_path))
-        cursor = conn.cursor()
+        with sqlite3.connect(str(config.sqlite_cache_path)) as conn:
+            cursor = conn.cursor()
 
-        # Get the scan ID if not provided
-        if scan_id is None:
-            cursor.execute(
-                """
-            SELECT id FROM scan_results
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-                (limit,),
-            )
+            # Get the scan ID if not provided
+            if scan_id is None:
+                cursor.execute(
+                    """
+                SELECT id FROM scan_results
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                    (limit,),
+                )
 
-            results = cursor.fetchall()
-            if not results:
-                conn.close()
-                return "No scan results found in database."
+                results = cursor.fetchall()
+                if not results:
+                    return "No scan results found in database."
 
             # For backward compatibility, use the first result as the primary scan_id
             # but now we can handle multiple results if needed in the future
@@ -1360,7 +1308,6 @@ def get_formatted_scan_results(scan_id=None, limit=1):
 
         scan_info = cursor.fetchone()
         if not scan_info:
-            conn.close()
             return f"No scan found with ID {scan_id}."
 
         host, base_path, scan_start, scan_end = scan_info
@@ -1418,13 +1365,17 @@ def get_formatted_scan_results(scan_id=None, limit=1):
 
 
 def save_scan_results(
-    orphaned_torrent_files: list,
-    only_in_torrents: list,
-    only_in_media: list,
+    orphaned_torrent_files: List[Dict[str, Any]],
+    only_in_torrents: List[Dict[str, Any]],
+    only_in_media: List[Dict[str, Any]],
     scan_start_time: datetime = None,
 ) -> None:
     """
     Save scan results to JSON file and optionally to the database.
+
+    Formats the scan results into a structured JSON format and saves to the
+    configured output file. Includes timestamp, file counts, and detailed
+    information about each file category.
 
     Args:
         orphaned_torrent_files: List of files in local torrent folder but not in Deluge
@@ -1475,8 +1426,8 @@ def clean_hash_cache(folder: Path, use_sqlite=False) -> None:
             return
 
         try:
-            conn = sqlite3.connect(str(config.sqlite_cache_path))
-            cursor = conn.cursor()
+            with sqlite3.connect(str(config.sqlite_cache_path)) as conn:
+                cursor = conn.cursor()
 
             # Get all entries for this folder
             cursor.execute(
@@ -1562,43 +1513,39 @@ def migrate_json_to_sqlite(no_progress: bool = False):
 
             logger.info(f"Migrating {len(hash_cache)} entries from {folder_desc} JSON cache to SQLite")
 
-            # Connect to the SQLite database
-            conn = sqlite3.connect(str(config.sqlite_cache_path))
-            cursor = conn.cursor()
-
-            # Use a transaction for better performance
-            conn.execute("BEGIN TRANSACTION")
-
             migrated_count = 0
-            with tqdm(
-                total=len(hash_cache),
-                desc=f"Migrating {folder_desc}",
-                disable=no_progress,
-            ) as pbar:
-                for relative_path, data in hash_cache.items():
-                    file_hash = data["hash"]
-                    mtime = data["mtime"]
 
-                    # Get the file size if the file exists
-                    full_path = folder_path / relative_path
-                    file_size = full_path.stat().st_size if full_path.exists() else 0
+            # Connect to the SQLite database using with statement for proper resource management
+            with sqlite3.connect(str(config.sqlite_cache_path)) as conn:
+                cursor = conn.cursor()
+                conn.execute("BEGIN TRANSACTION")
 
-                    # Insert or replace the entry in the SQLite database
-                    cursor.execute(
-                        """
-                    INSERT OR REPLACE INTO file_hashes
-                    (file_hash, folder_path, relative_path, mtime, file_size)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                        (file_hash, str(folder_path), relative_path, mtime, file_size),
-                    )
+                with tqdm(
+                    total=len(hash_cache),
+                    desc=f"Migrating {folder_desc}",
+                    disable=no_progress,
+                ) as pbar:
+                    for relative_path, data in hash_cache.items():
+                        file_hash = data["hash"]
+                        mtime = data["mtime"]
 
-                    migrated_count += 1
-                    pbar.update(1)
+                        full_path = folder_path / relative_path
+                        file_size = full_path.stat().st_size if full_path.exists() else 0
 
-            # Commit the transaction
-            conn.commit()
-            conn.close()
+                        # Insert or replace the entry in the SQLite database
+                        cursor.execute(
+                            """
+                        INSERT OR REPLACE INTO file_hashes
+                        (file_hash, folder_path, relative_path, mtime, file_size)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                            (file_hash, str(folder_path), relative_path, mtime, file_size),
+                        )
+
+                        migrated_count += 1
+                        pbar.update(1)
+
+                # Transaction is automatically committed when the with block exits
 
             logger.info(f"Successfully migrated {migrated_count} entries from {folder_desc} JSON cache to SQLite")
             total_migrated += migrated_count
@@ -1620,22 +1567,21 @@ def list_scan_history(limit=10):
         str: Formatted scan history
     """
     try:
-        conn = sqlite3.connect(str(config.sqlite_cache_path))
-        cursor = conn.cursor()
+        with sqlite3.connect(str(config.sqlite_cache_path)) as conn:
+            cursor = conn.cursor()
 
-        cursor.execute(
-            """
-        SELECT id, host, scan_start, scan_end, created_at,
-               (SELECT COUNT(*) FROM file_scan_history WHERE scan_id = scan_results.id) as file_count
-        FROM scan_results
-        ORDER BY created_at DESC
-        LIMIT ?
-        """,
-            (limit,),
-        )
+            cursor.execute(
+                """
+            SELECT id, host, scan_start, scan_end, created_at,
+                   (SELECT COUNT(*) FROM file_scan_history WHERE scan_id = scan_results.id) as file_count
+            FROM scan_results
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+                (limit,),
+            )
 
-        scans = cursor.fetchall()
-        conn.close()
+            scans = cursor.fetchall()
 
         if not scans:
             return "No scan history found in database."
@@ -1662,9 +1608,6 @@ def list_scan_history(limit=10):
         return f"Error retrieving scan history: {str(e)}"
 
 
-# --- New functions to be inserted ---
-
-
 def get_files_to_mark_for_deletion(db_path: Path) -> List[Dict[str, Any]]:
     """
     Retrieves files that are active and meet the criteria for being marked for deletion.
@@ -1683,7 +1626,7 @@ def get_files_to_mark_for_deletion(db_path: Path) -> List[Dict[str, Any]]:
     try:
         with sqlite3.connect(str(db_path)) as conn:
             cursor = conn.cursor()
-            # Use the existing view that identifies these files
+
             cursor.execute(
                 """
                 SELECT
@@ -1761,12 +1704,10 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
         return
 
     if force_delete:
-        logger.info(
-            "Force delete enabled. Attempting to delete all 'active' orphaned files from 'local_torrent_folder' source immediately."
-        )
+        logger.info("Force delete enabled. Attempting to delete all 'active' orphaned files from 'local_torrent_folder' source immediately.")
         files_to_remove_directly = []
         try:
-            with sqlite3.connect(str(db_path)) as conn:  # Connection for fetching
+            with sqlite3.connect(str(db_path)) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -1788,14 +1729,11 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
         logger.info(f"Found {len(files_to_remove_directly)} active torrent orphans for immediate deletion.")
         deleted_count = 0
 
-        # Use the passed torrent_base_folder parameter
         if not torrent_base_folder.exists() or not torrent_base_folder.is_dir():
-            logger.error(
-                f"Provided torrent_base_folder '{torrent_base_folder}' does not exist or is not a directory. Cannot proceed with deletions."
-            )
+            logger.error(f"Provided torrent_base_folder '{torrent_base_folder}' does not exist or is not a directory. " f"Cannot proceed with deletions.")
             return
 
-        with sqlite3.connect(str(db_path)) as conn:  # Connection for delete operations
+        with sqlite3.connect(str(db_path)) as conn:
             cursor = conn.cursor()
             for file_info in files_to_remove_directly:
                 file_id = file_info["id"]
@@ -1817,9 +1755,7 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
                         )
                         deleted_count += 1
                     else:
-                        logger.warning(
-                            f"File not found during force delete: {absolute_file_path}. Updating status to 'deleted' as it's gone."
-                        )
+                        logger.warning(f"File not found during force delete: {absolute_file_path}. " f"Updating status to 'deleted' as it's gone.")
                         # Update status even if file not found, as it's effectively gone from orphan perspective
                         cursor.execute(
                             """
@@ -1831,9 +1767,7 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
                         )
                     conn.commit()
                 except FileNotFoundError:  # Should be caught by .exists(), but as a fallback
-                    logger.warning(
-                        f"File not found (caught by except FileNotFoundError) during force delete: {absolute_file_path}. Updating status to 'deleted'."
-                    )
+                    logger.warning(f"File not found (caught by except FileNotFoundError) during force delete: {absolute_file_path}. Updating status to 'deleted'.")
                     cursor.execute(
                         "UPDATE orphaned_files SET status = 'deleted', deletion_date = CURRENT_TIMESTAMP WHERE id = ? AND status != 'deleted';",
                         (file_id,),
@@ -1844,13 +1778,9 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
                 except OSError as e:
                     logger.error(f"OS error during force delete of file {absolute_file_path}: {e}")
                 except sqlite3.Error as e:
-                    logger.error(
-                        f"SQLite error updating status for file ID {file_id} ({absolute_file_path}) after force delete attempt: {e}"
-                    )
+                    logger.error(f"SQLite error updating status for file ID {file_id} ({absolute_file_path}) after force delete attempt: {e}")
                     conn.rollback()
-        logger.info(
-            f"Force deletion process completed. Attempted to delete {len(files_to_remove_directly)} files, successfully deleted {deleted_count}."
-        )
+        logger.info(f"Force deletion process completed. Attempted to delete {len(files_to_remove_directly)} files, successfully deleted {deleted_count}.")
     else:
         logger.info("Dry run for deletions. Identifying files eligible for deletion and marking them...")
         files_to_mark = get_files_to_mark_for_deletion(db_path)
@@ -1866,10 +1796,7 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
                 size = file_info["size_human"]
                 days_diff = file_info["days_seen_difference"]
                 scans = file_info["consecutive_scans"]
-                logger.info(
-                    f"File eligible for deletion: {file_path_str} (Size: {size}, Seen for ~{days_diff:.0f} days over {scans} scans). "
-                    f"Marking for deletion. Run with --force to remove."
-                )
+                logger.info(f"File eligible for deletion: {file_path_str} (Size: {size}, Seen for ~{days_diff:.0f} days over {scans} scans). " f"Marking for deletion. Run with --force to remove.")
                 try:
                     cursor.execute(
                         """
@@ -1903,7 +1830,7 @@ def process_autoremove_labeling(
         apply_labels (bool): If True, actually apply labels. Otherwise, dry run.
         target_label_prefix (str): The prefix of the label to apply. If None, uses config.deluge_autoremove_label.
     """
-    # Use config value if no target label prefix is provided
+
     if target_label_prefix is None:
         target_label_prefix = config.deluge_autoremove_label
     files_to_process_from_view = []
@@ -1916,8 +1843,8 @@ def process_autoremove_labeling(
                 files_to_process_from_view.append(
                     {
                         "path": row[0],
-                        "label": row[1],  # This is current_label from the view
-                        "torrent_id": row[2],  # This is torrent_id from the view
+                        "label": row[1],
+                        "torrent_id": row[2],
                     }
                 )
     except sqlite3.Error as e:
@@ -1953,9 +1880,7 @@ def process_autoremove_labeling(
         processed_torrent_hashes.add(torrent_id)
 
         if current_label and current_label.startswith(target_label_prefix):
-            logger.debug(
-                f"Torrent ID {torrent_id} (file: {file_path}) already has label '{current_label}' starting with '{target_label_prefix}'. Skipping."
-            )
+            logger.debug(f"Torrent ID {torrent_id} (file: {file_path}) already has label '{current_label}' starting with '{target_label_prefix}'. Skipping.")
             continue
 
         new_label = target_label_prefix  # Simple case, could be made more complex e.g., {label}.tv or {label}.movie
@@ -1965,31 +1890,40 @@ def process_autoremove_labeling(
         if apply_labels:
             try:
                 client.label.set_torrent(torrent_id, new_label)
-                logger.info(
-                    f"Applied label '{new_label}' to torrent ID {torrent_id} (file: {file_path}). Previous label: '{current_label}'."
-                )
+                logger.info(f"Applied label '{new_label}' to torrent ID {torrent_id} (file: {file_path}). Previous label: '{current_label}'.")
                 label_applied_count += 1
             except Exception as e:
                 logger.error(f"Error applying label '{new_label}' to torrent ID {torrent_id} (file: {file_path}): {e}")
         else:
-            logger.info(
-                f"[DRY RUN] Would apply label '{new_label}' to torrent ID {torrent_id} (file: {file_path}). Previous label: '{current_label}'."
-            )
+            logger.info(f"[DRY RUN] Would apply label '{new_label}' to torrent ID {torrent_id} (file: {file_path}). Previous label: '{current_label}'.")
             label_would_be_applied_count += 1
 
     if apply_labels:
         logger.info(f"Finished processing labels. Applied '{target_label_prefix}' to {label_applied_count} torrents.")
     else:
-        logger.info(
-            f"Finished processing labels (dry run). Would have applied '{target_label_prefix}' to {label_would_be_applied_count} torrents."
-        )
+        logger.info(f"Finished processing labels (dry run). Would have applied '{target_label_prefix}' to {label_would_be_applied_count} torrents.")
 
 
-def main():
+def main() -> None:
+    """
+    Main entry point for the Deluge Orphaned Files application.
+
+    Parses command line arguments and executes the appropriate functionality based on those arguments.
+    Main operations include:
+    - Finding orphaned files by comparing Deluge client data with local files
+    - Managing the file hash cache (cleaning, migrating)
+    - Processing file deletions for orphaned files
+    - Applying auto-remove labels to torrents
+    - Displaying scan results and history
+    """
     print_version_info()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--clean-cache", action="store_true", help="Clean stale entries from hash cache")
+    parser.add_argument(
+        "--clean-cache",
+        action="store_true",
+        help="Clean the hash cache by removing entries for files that no longer exist",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--trace", action="store_true", help="Enable trace logging")
     parser.add_argument(
@@ -2004,10 +1938,10 @@ def main():
     )
     parser.add_argument(
         "--migrate-to-sqlite",
+        dest="migrate_to_sqlite",
         action="store_true",
         help="Migrate data from JSON hash caches to SQLite database",
     )
-    parser.add_argument("--show-last", action="store_true", help="Display the most recent scan results")
     parser.add_argument("--list-scans", action="store_true", help="List all previous scans")
     parser.add_argument("--scan-id", type=int, help="Show results for a specific scan ID")
     parser.add_argument(
@@ -2019,14 +1953,17 @@ def main():
     parser.add_argument("--no-progress", action="store_true", help="Disable progress bars")
     parser.add_argument(
         "--force",
+        dest="force",
         action="store_true",
-        help="Actually delete files marked for deletion. Otherwise, performs a dry run (marks files).",
+        help="Actually delete files marked for deletion (dangerous, use with caution)",
     )
     parser.add_argument(
         "--apply-autoremove-labels",
         action="store_true",
-        help=f"Apply '{config.deluge_autoremove_label}' label in Deluge to torrents found only on torrent disk (not in media) and not already labeled as such. Dry run if not specified but items exist.",
+        help="Apply '{}' label in Deluge to torrents found only on torrent disk (not in media) "
+        "and not already labeled as such. Dry run if not specified but items exist.".format(config.deluge_autoremove_label),
     )
+    parser.add_argument("--show-last", action="store_true", help="Show results for the most recent scan")
     args = parser.parse_args()
 
     if args.debug:
@@ -2107,13 +2044,9 @@ def main():
     scan_id = find_orphaned_files(skip_media_check=args.skip_media_check, use_sqlite=True, no_progress=args.no_progress)
 
     if args.apply_autoremove_labels:
-        logger.info(
-            f"Attempting to apply '{config.deluge_autoremove_label}' labels to eligible torrents based on the latest scan..."
-        )
+        logger.info(f"Attempting to apply '{config.deluge_autoremove_label}' labels to eligible torrents based on the latest scan...")
     else:
-        logger.info(
-            f"Performing dry-run for '{config.deluge_autoremove_label}' labeling. Use --apply-autoremove-labels to apply changes."
-        )
+        logger.info(f"Performing dry-run for '{config.deluge_autoremove_label}' labeling. Use --apply-autoremove-labels to apply changes.")
 
     deluge_client = None
     try:
@@ -2135,9 +2068,7 @@ def main():
         else:
             logger.error(f"Failed to connect to Deluge for labeling. Skipping '{config.deluge_autoremove_label}' labeling.")
     except ConnectionRefusedError:
-        logger.error(
-            f"Deluge connection refused at {config.deluge_host}:{config.deluge_port}. Skipping '{config.deluge_autoremove_label}' labeling. Ensure Deluge is running and accessible."
-        )
+        logger.error(f"Deluge connection refused at {config.deluge_host}:{config.deluge_port}. Skipping '{config.deluge_autoremove_label}' labeling. Ensure Deluge is running and accessible.")
     except Exception as e:
         logger.error(f"An error occurred during '{config.deluge_autoremove_label}' labeling: {e}. Skipping.")
     finally:
@@ -2151,9 +2082,7 @@ def main():
             logger.info(f"To view these results later, use: --scan-id {scan_id} --sqlite")
 
         logger.info(f"Processing potential deletions (Force mode: {args.force})...")
-        process_deletions(
-            force_delete=args.force, db_path=config.sqlite_cache_path, torrent_base_folder=config.local_torrent_base_local_folder
-        )
+        process_deletions(force_delete=args.force, db_path=config.sqlite_cache_path, torrent_base_folder=config.local_torrent_base_local_folder)
     elif not args.sqlite:
         logger.info(f"Scan results saved to {config.output_file}")
         logger.info("Deletion processing (--force) is only available with --sqlite mode.")
