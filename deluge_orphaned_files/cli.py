@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import json
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from .deluge.client import get_deluge_files as deluge_get_files
 from tqdm import tqdm
 from typing import TYPE_CHECKING
@@ -1842,8 +1842,9 @@ def process_autoremove_labeling(
         logger.info(f"No torrents found needing the '{target_label_prefix}' label based on the latest scan data.")
         return
 
-    # Calculate the due date for the actions
-    action_due_at = datetime.utcnow() + timedelta(days=config.relabel_action_delay_days)
+    # Calculate the due date for the actions with a safe fallback value
+    relabel_delay = getattr(config, "relabel_action_delay_days", 7)  # Default 7 days if not set
+    action_due_at = datetime.now(timezone.utc) + timedelta(days=relabel_delay)
     action_due_at_str = action_due_at.isoformat()
     
     logger.info(f"Found {len(files_to_process)} torrents to potentially label with '{target_label_prefix}'.")

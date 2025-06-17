@@ -177,7 +177,11 @@ def _delete_marked_files(*, db_path: Path, torrent_base_folder: Path) -> None:
         cursor = conn.cursor()
         for entry in files_to_remove:
             file_id = entry["id"]
-            absolute_path = torrent_base_folder / entry["path"]
+            relative_path = Path(entry["path"]).relative_to("/")
+            absolute_path = (torrent_base_folder / relative_path).resolve()
+            if torrent_base_folder not in absolute_path.parents:
+                logger.error("Refusing to delete outside base folder: {}", absolute_path)
+                continue
             try:
                 if absolute_path.exists():
                     os.remove(absolute_path)

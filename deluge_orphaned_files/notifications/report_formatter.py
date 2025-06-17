@@ -139,7 +139,14 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
                 for path, current_label, size_human, proposed_action, action_details, action_due_at in pending_actions:
                     # Format the due date as a relative time
                     try:
-                        due_date = datetime.strptime(action_due_at, "%Y-%m-%d %H:%M:%S")
+                        # Try to parse using multiple formats to handle both ISO and standard formats
+                        try:
+                            # Try ISO format first (with T separator)
+                            due_date = datetime.strptime(action_due_at, "%Y-%m-%dT%H:%M:%S")
+                        except ValueError:
+                            # Fall back to standard format
+                            due_date = datetime.strptime(action_due_at, "%Y-%m-%d %H:%M:%S")
+                            
                         days_until = (due_date - now).days
                         if days_until < 0:
                             when = "Overdue"
@@ -149,7 +156,8 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
                             when = "Tomorrow"
                         else:
                             when = f"{days_until} days"
-                    except ValueError:
+                    except ValueError as e:
+                        logger.warning(f"Failed to parse due date '{action_due_at}': {e}")
                         when = action_due_at  # Fallback if date parsing fails
                     
                     # Determine the resolution based on action type

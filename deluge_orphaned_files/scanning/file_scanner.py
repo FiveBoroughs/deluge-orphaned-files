@@ -63,7 +63,8 @@ def should_process_file(filepath: Path, stat_result: os.stat_result, config: App
         return False
 
     # Ignore obvious samples / extras by substring in path (lower-case search)
-    path_lower = str(filepath).lower()
+    # Normalize path separators for cross-platform compatibility
+    path_lower = str(filepath).lower().replace(os.sep, "/")
     if any(pattern in path_lower for pattern in ("/sample", "/featurettes", "/extras", ".sample", "-sample")):
         logger.trace("Skipping {} due to sample/featurette pattern.", filepath.name)
         return False

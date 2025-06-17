@@ -67,12 +67,30 @@ def _send_in_chunks(*, bot_token: str, chat_id: str, title: str, content: str, c
     # Process lines into chunks
     for line in lines:
         line_length = len(line) + 1  # +1 for newline
-        if current_length + line_length > chunk_size and current_chunk:
-            chunks.append("\n".join(current_chunk))
-            current_chunk = []
-            current_length = 0
-        current_chunk.append(line)
-        current_length += line_length
+        
+        # Handle lines longer than chunk_size
+        if line_length > chunk_size:
+            # If we have accumulated content already, save it as a chunk first
+            if current_chunk:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = []
+                current_length = 0
+            
+            # Split long line into sub-chunks
+            for i in range(0, len(line), chunk_size):
+                sub_chunk = line[i:i + chunk_size]
+                # Each sub-chunk becomes its own complete chunk
+                chunks.append(sub_chunk)
+        # Normal case - line fits within chunk_size
+        else:
+            # Start a new chunk if adding this line would exceed chunk_size
+            if current_length + line_length > chunk_size:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = []
+                current_length = 0
+            
+            current_chunk.append(line)
+            current_length += line_length
 
     if current_chunk:
         chunks.append("\n".join(current_chunk))

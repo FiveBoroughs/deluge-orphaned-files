@@ -67,46 +67,58 @@ def get_deluge_files(config: DelugeConfig) -> Tuple[Set[str], Dict[str, str], Di
         username=config.deluge_username,
         password=config.deluge_password,
     )
-    client.connect()
-
+    
     logger.debug("Connecting to Deluge: {}:{}", config.deluge_host, config.deluge_port)
-    logger.info(
-        "Fetching torrent list from {}@{}:{}...",
-        config.deluge_username,
-        config.deluge_host,
-        config.deluge_port,
-    )
-
-    torrent_list = client.call("core.get_torrents_status", {}, ["files", "save_path", "label"])
-
+    
     all_files: set[str] = set()
     file_labels: Dict[str, str] = {}
     file_torrent_ids: Dict[str, str] = {}
+    
+    try:
+        client.connect()
+        
+        logger.info(
+            "Fetching torrent list from {}@{}:{}...",
+            config.deluge_username,
+            config.deluge_host,
+            config.deluge_port,
+        )
 
-    norm_deluge_base_remote_folder = os.path.normpath(config.deluge_torrent_base_remote_folder)
+        torrent_list = client.call("core.get_torrents_status", {}, ["files", "save_path", "label"])
+        norm_deluge_base_remote_folder = os.path.normpath(config.deluge_torrent_base_remote_folder)
 
-    for torrent_id, torrent_data in torrent_list.items():
-        # Ensure torrent_id is a string, not bytes
-        torrent_id_str = torrent_id.decode() if isinstance(torrent_id, bytes) else torrent_id
-        save_path = os.path.normpath(torrent_data[b"save_path"].decode())
-        label = torrent_data.get(b"label", b"").decode() or "No Label"
+        for torrent_id, torrent_data in torrent_list.items():
+            # Ensure torrent_id is a string, not bytes
+            torrent_id_str = torrent_id.decode() if isinstance(torrent_id, bytes) else torrent_id
+            save_path = os.path.normpath(torrent_data[b"save_path"].decode())
+            label = torrent_data.get(b"label", b"").decode() or "No Label"
 
-        for file in torrent_data[b"files"]:
-            file_path_in_torrent = os.path.normpath(file[b"path"].decode())
-            full_path = os.path.normpath(os.path.join(save_path, file_path_in_torrent))
-            relative_path = os.path.relpath(full_path, norm_deluge_base_remote_folder)
+            for file in torrent_data[b"files"]:
+                file_path_in_torrent = os.path.normpath(file[b"path"].decode())
+                full_path = os.path.normpath(os.path.join(save_path, file_path_in_torrent))
+                relative_path = os.path.relpath(full_path, norm_deluge_base_remote_folder)
 
-            # Safety check: ensure path does not escape base folder
-            if ".." in Path(relative_path).parts:
-                logger.warning(
-                    "File '{}' appears outside base folder '{}'. Relative path: '{}'.",
-                    full_path,
-                    norm_deluge_base_remote_folder,
-                    relative_path,
-                )
+                # Safety check: ensure path does not escape base folder
+                if ".." in Path(relative_path).parts:
+                    logger.warning(
+                        "File '{}' appears outside base folder '{}'. Relative path: '{}'.",
+                        full_path,
+                        norm_deluge_base_remote_folder,
+                        relative_path,
+                    )
 
-            all_files.add(relative_path)
-            file_labels[relative_path] = label
-            file_torrent_ids[relative_path] = torrent_id_str
+                all_files.add(relative_path)
+                file_labels[relative_path] = label
+                file_torrent_ids[relative_path] = torrent_id_str
+        
+        logger.success("Found {} files in Deluge", len(all_files))
+    finally:
+        # Ensure client is disconnected properly
+        try:
+            if client.connected:
+                client.disconnect()
+                logger.debug("Disconnected from Deluge client")
+        except Exception as e:
+            logger.warning("Error disconnecting from Deluge: {}", e)
 
     return all_files, file_labels, file_torrent_ids

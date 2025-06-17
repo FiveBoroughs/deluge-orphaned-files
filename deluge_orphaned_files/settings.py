@@ -191,4 +191,5 @@ except ValidationError as exc:  # noqa: BLE001
         variable_name = detail.get("loc", ["Unknown"])[0]
         message = detail.get("msg", "Unknown error")
         logger.error("  %s: %s", variable_name, message)
-    sys.exit(1)
+    # Re-raise the exception to allow the calling code to handle it
+    raise
