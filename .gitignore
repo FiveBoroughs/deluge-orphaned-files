@@ -29,3 +29,4 @@ comparison_results.txt
 
 # Ignore database
 deluge_orphaned_files.db
+.devdbrc

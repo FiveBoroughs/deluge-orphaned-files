@@ -1,10 +1,16 @@
+from __future__ import annotations
+
 import os
 import json
 from pathlib import Path
-from datetime import datetime
-from deluge_client import DelugeRPCClient
-import hashlib
+from datetime import datetime, timedelta
+from .deluge.client import get_deluge_files as deluge_get_files
 from tqdm import tqdm
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    from deluge_client import DelugeRPCClient
+
 import argparse
 import sqlite3
 from loguru import logger
@@ -14,12 +20,34 @@ from pydantic import (
     Field,
     field_validator,
     model_validator,
-    ValidationError,
     ValidationInfo,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-__version__ = "0.1.0"
+from .scanning.hasher import get_file_hash
+from .scanning.file_scanner import (
+    should_process_file,
+    get_local_files as _scan_get_local_files,
+    load_hash_cache as scan_load_hash_cache,
+    save_hash_cache as scan_save_hash_cache,
+    load_hashes_from_sqlite as scan_load_hashes_from_sqlite,
+)
+from .database.hash_cache import (
+    init_sqlite_cache as db_init_sqlite_cache,
+    load_hashes_from_sqlite as db_load_hashes_from_sqlite,
+    upsert_hash_to_sqlite as db_upsert_hash_to_sqlite,
+)
+from .logic.orphan_finder import compute_orphans
+from .logic.retention import (
+    get_files_to_mark_for_deletion as retention_get_files_to_mark,
+    get_files_to_actually_delete as retention_get_files_to_delete,
+    process_deletions as retention_process_deletions,
+)
+from .notifications.report_formatter import (
+    format_scan_results as _format_scan_results,
+)
+from .notifications.emailer import send_scan_report
+from .notifications.telegram_notifier import send_scan_report as send_telegram_report
+from . import __version__
 
 # Configure Loguru
 log_file_path = Path(__file__).parent / "deluge_orphaned_files.log"
@@ -37,7 +65,38 @@ logger.add(
     format=("{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | " "{name}:{function}:{line} - {message}"),
 )
 
-logger.info(f"Logging initialized. Log file: {log_file_path}")
+logger.info("Logging initialized. Log file: {}", log_file_path)
+
+
+# ---------------------------------------------------------------------------
+# Misc helper
+# ---------------------------------------------------------------------------
+
+# Ensure users see path of log file at startup
+# (Already logged above; removed duplicate)
+
+
+def print_version_info() -> None:
+    """Log current application version to the standard logger.
+    
+    Outputs version information to the logger at INFO level.
+    """
+    logger.info("Deluge Orphaned Files v{}", __version__)
+
+
+# ---------------------------------------------------------------------------
+# Global configuration (shared across all modules)
+# ---------------------------------------------------------------------------
+
+# NOTE: The canonical AppConfig and the *singleton* "config" object now live
+# in :pymod:`deluge_orphaned_files.settings`.  Importing it here ensures we
+# share the exact same instance everywhere (including sub-modules executed
+# earlier via their own imports).
+
+from .settings import config  # noqa: E402  – import after logger setup for readable init logs
+
+# Legacy per-file AppConfig instantiation removed – we now rely on
+# settings.config which has already validated all environment variables.
 
 
 class AppConfig(BaseSettings):
@@ -67,6 +126,22 @@ class AppConfig(BaseSettings):
     # Final list fields, populated by model_validator
     extensions_blacklist: List[str] = Field(default_factory=list, alias="_DO_NOT_LOAD_EXTENSIONS_BLACKLIST_FROM_ENV_")
     local_subfolders_blacklist: List[str] = Field(default_factory=list, alias="_DO_NOT_LOAD_LOCAL_SUBFOLDERS_BLACKLIST_FROM_ENV_")
+
+    # SMTP / e-mail settings
+    smtp_host: Optional[str] = Field(default=None, alias="SMTP_HOST")
+    smtp_port: int = Field(default=465, alias="SMTP_PORT")
+    smtp_username: Optional[str] = Field(default=None, alias="SMTP_USERNAME")
+    smtp_password: Optional[str] = Field(default=None, alias="SMTP_PASSWORD")
+    smtp_from_addr: Optional[str] = Field(default=None, alias="SMTP_FROM_ADDR")
+    raw_smtp_to_str: Optional[str] = Field(default=None, alias="SMTP_TO_ADDRS")
+    smtp_to_addrs: List[str] = Field(default_factory=list, alias="_INTERNAL_SMTP_TO_LIST")
+    smtp_use_ssl: bool = Field(default=True, alias="SMTP_USE_SSL")
+
+    deluge_autoremove_label: str = Field(default="othercat", alias="DELUGE_AUTOREMOVE_LABEL")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    telegram_bot_token: Optional[str] = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: Optional[str] = Field(default=None, alias="TELEGRAM_CHAT_ID")
 
     @field_validator(
         "local_torrent_base_local_folder",
@@ -115,69 +190,49 @@ class AppConfig(BaseSettings):
             self.local_subfolders_blacklist = [item.strip() for item in effective_sub_str.split(",") if item.strip()]
         else:  # Should not happen if default_sub_str is used
             self.local_subfolders_blacklist = []
+
+        # Parse SMTP recipient list
+        if self.raw_smtp_to_str:
+            self.smtp_to_addrs = [addr.strip() for addr in self.raw_smtp_to_str.split(",") if addr.strip()]
+        else:
+            self.smtp_to_addrs = []
         return self
 
     sqlite_cache_path: Path = Field(alias="APP_SQLITE_CACHE_PATH")
-    deluge_autoremove_label: str = Field(default="othercat", alias="DELUGE_AUTOREMOVE_LABEL")
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @field_validator("sqlite_cache_path", mode="before")
+    def _validate_sqlite_cache_path(cls, v: Any, info: ValidationInfo) -> Path:
+        if v is None:
+            raise ValueError(f"{info.field_name} must be set in environment variables")
+        path_obj = Path(v)
+        parent_dir = path_obj.parent
+        if not parent_dir.exists():
+            raise ValueError(f"Parent directory for {info.field_name} does not exist: {parent_dir}")
+        if not parent_dir.is_dir():
+            raise ValueError(f"Parent path for {info.field_name} is not a directory: {parent_dir}")
+        if not os.access(parent_dir, os.W_OK):
+            raise ValueError(f"Parent directory for {info.field_name} is not writable: {parent_dir}")
+        return path_obj
 
 
-try:
-    config = AppConfig()
-    logger.info("Environment configuration loaded and validated successfully using Pydantic.")
-except ValidationError as e:
-    logger.error("!!! Configuration Error !!!")
-    for error_detail in e.errors():
-        variable_name = error_detail["loc"][0] if error_detail["loc"] else "UnknownField"
-        message = error_detail["msg"]
-        logger.error(f"  Variable '{variable_name}': {message}")
-    logger.error("Please check your .env file or environment variable settings.")
-    sys.exit(1)
-
-
-def print_version_info():
-    logger.info(f"Deluge Orphaned Files Checker v{__version__}")
-
-
-# The verify_paths() function has been removed as its logic is now in validate_env_config().
-
-
-# Helper function to check if file should be processed
-
-
-def should_process_file(filepath: Path, stat_result: os.stat_result) -> bool:
-    """Checks if a file should be processed based on various criteria."""
-    # Check extension and name blacklist
-    if filepath.suffix.lower() in config.extensions_blacklist or filepath.name in config.extensions_blacklist:
-        logger.trace(f"Skipping {filepath.name} due to extension/name blacklist.")
-        return False
-
-    # Check for sample files and featurettes (path-based)
-    path_lower = str(filepath).lower()
-    if any(pattern in path_lower for pattern in ["/sample", "/featurettes", "/extras", ".sample", "-sample"]):
-        logger.trace(f"Skipping {filepath.name} due to sample/featurette pattern.")
-        return False
-
-    # Check minimum file size
-    min_size_bytes = config.min_file_size_mb * 1024 * 1024
-    if stat_result.st_size < min_size_bytes:
-        logger.trace((f"Skipping {filepath.name} due to size: {stat_result.st_size} bytes " f"< {min_size_bytes} bytes ({config.min_file_size_mb} MB)"))
-        return False
-
-    return True
-
-
-def init_sqlite_cache(db_path):
-    """
-    Initializes the SQLite cache database.
-    Creates the database file if it doesn't exist and
-    creates the necessary tables if they don't exist.
-
-    Tables:
-    - file_hashes: For caching file hashes to improve performance
-    - scan_results: For storing metadata about each scan
-    - orphaned_files: For tracking files that are orphaned
-    - file_scan_history: For tracking file presence in each scan
+def init_sqlite_cache(db_path: Path) -> None:
+    """Initialize the SQLite cache database.
+    
+    Creates the database file if it doesn't exist and creates the necessary tables if they don't exist.
+    
+    Args:
+        db_path: Path to the SQLite database file to initialize.
+        
+    Raises:
+        sqlite3.Error: If there's an error during database operations.
+        Exception: For any other unexpected errors.
+    
+    Tables created:
+        - file_hashes: For caching file hashes to improve performance
+        - scan_results: For storing metadata about each scan
+        - orphaned_files: For tracking files that are orphaned
+        - file_scan_history: For tracking file presence in each scan
+        - Views: Various views for facilitating reports and file management
     """
     db_exists = os.path.exists(db_path)
     if not db_exists:
@@ -259,7 +314,38 @@ def init_sqlite_cache(db_path):
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_fsh_scan_id ON file_scan_history (scan_id);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_fsh_file_id ON file_scan_history (file_id);")
-
+            
+            logger.trace("Ensuring 'pending_actions' table exists.")
+            cursor.execute(
+                """
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                orphaned_file_id INTEGER NOT NULL,
+                torrent_id TEXT,
+                file_path TEXT NOT NULL,
+                current_label TEXT,
+                proposed_action TEXT NOT NULL,  -- e.g., 'RELABEL_OTHERCAT'
+                action_details TEXT,            -- e.g., target label
+                size_human TEXT NOT NULL,
+                scan_id_identified INTEGER NOT NULL,
+                identified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                action_due_at TIMESTAMP NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'completed', 'cancelled', 'failed'
+                scan_id_processed INTEGER,
+                processed_at TIMESTAMP,
+                processing_notes TEXT,
+                FOREIGN KEY (orphaned_file_id) REFERENCES orphaned_files(id),
+                FOREIGN KEY (scan_id_identified) REFERENCES scan_results(id),
+                FOREIGN KEY (scan_id_processed) REFERENCES scan_results(id)
+            );
+            """
+            )
+            
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_status ON pending_actions (status);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_action_due_at ON pending_actions (action_due_at);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_orphaned_file_id ON pending_actions (orphaned_file_id);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_scan_id_identified ON pending_actions (scan_id_identified);")
+            
             logger.trace("Ensuring 'vw_latest_scan_report' view exists.")
             cursor.execute(
                 """
@@ -355,7 +441,8 @@ def init_sqlite_cache(db_path):
                 of.id AS file_id,
                 of.path AS file_path,
                 of.label AS current_label,
-                of.torrent_id
+                of.torrent_id,
+                of.size_human
             FROM orphaned_files of
             JOIN file_scan_history fsh ON of.id = fsh.file_id
             JOIN scan_results sr ON fsh.scan_id = sr.id
@@ -380,23 +467,25 @@ def init_sqlite_cache(db_path):
 
 
 def load_hashes_from_sqlite(db_path: str, folder_path: Path) -> Dict[str, Dict[str, Any]]:
-    """
-    Load cache data from the SQLite database for a specific folder.
+    """Load cache data from the SQLite database for a specific folder.
 
     Args:
-        db_path (str): Path to the SQLite database file
-        folder_path (str): Absolute path of the folder to load cache for
+        db_path: Path to the SQLite database file.
+        folder_path: Absolute path of the folder to load cache for.
 
     Returns:
-        dict: A dictionary where keys are relative file paths and values are
-              dictionaries with 'hash' and 'mtime' fields
+        Dictionary where keys are relative file paths and values are
+        dictionaries with 'hash', 'mtime', and 'size' fields.
+        
+    Raises:
+        sqlite3.Error: If there's an error during database operations.
     """
     cache = {}
 
     if not os.path.exists(db_path):
         logger.warning(f"SQLite cache file not found at {db_path}")
         return cache
-
+        
     try:
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
@@ -437,19 +526,21 @@ def upsert_hash_to_sqlite(
     mtime: float,
     file_size: int,
 ) -> bool:
-    """
-    Insert or update a file hash entry in the SQLite database.
+    """Insert or update a file hash entry in the SQLite database.
 
     Args:
-        db_path (str): Path to the SQLite database file
-        folder_path (str): Absolute path of the scanned folder
-        relative_path (str): Path relative to folder_path
-        file_hash (str): MD5 hash of the file
-        mtime (float): Modification timestamp of the file
-        file_size (int): Size of the file in bytes
+        db_path: Path to the SQLite database file.
+        folder_path: Absolute path of the scanned folder.
+        relative_path: Path relative to folder_path.
+        file_hash: MD5 hash of the file.
+        mtime: Modification timestamp of the file.
+        file_size: Size of the file in bytes.
 
     Returns:
-        bool: True if the operation was successful, False otherwise
+        True if the operation was successful, False otherwise.
+        
+    Raises:
+        sqlite3.Error: If there's an error during database operations.
     """
     try:
         with sqlite3.connect(db_path) as conn:
@@ -472,74 +563,29 @@ def upsert_hash_to_sqlite(
         return False
 
 
-def get_deluge_files() -> Tuple[set, Dict[str, str], Dict[str, str]]:
-    """
-    Connect to Deluge client and retrieve information about all torrents.
-
+def get_deluge_files() -> Tuple[Set[str], Dict[str, str], Dict[str, str]]:
+    """Connect to Deluge client and retrieve information about all torrents.
+    
+    Uses the global config object for connection parameters.
+    
     Returns:
-        Tuple[set, Dict[str, str], Dict[str, str]]: A tuple containing:
-            - set of all file paths in Deluge
-            - dictionary mapping file paths to their labels
-            - dictionary mapping file paths to their torrent IDs
+        A tuple containing:
+            - Set of all file paths in Deluge
+            - Dictionary mapping file paths to their labels
+            - Dictionary mapping file paths to their torrent IDs
     """
-    client = DelugeRPCClient(
-        config.deluge_host,
-        config.deluge_port,
-        config.deluge_username,
-        config.deluge_password,
-    )
-    client.connect()
-
-    logger.debug(f"Connecting to Deluge: {config.deluge_host}:{config.deluge_port}")
-    logger.info(f"Fetching torrent list from {client.username}@{client.host}:{client.port}...")
-    torrent_list = client.call("core.get_torrents_status", {}, ["files", "save_path", "label"])
-
-    all_files = set()
-    file_labels = {}
-    file_torrent_ids = {}
-    for torrent_id, torrent_data in torrent_list.items():
-        save_path = torrent_data[b"save_path"].decode()
-        label = torrent_data.get(b"label", b"").decode() or "No Label"
-        for file in torrent_data[b"files"]:
-            file_path_in_torrent = file[b"path"].decode()  # Path of file *within* the torrent, relative to save_path
-
-            norm_save_path = os.path.normpath(save_path)
-
-            norm_file_path_in_torrent = os.path.normpath(file_path_in_torrent)
-            norm_deluge_base_remote_folder = os.path.normpath(config.deluge_torrent_base_remote_folder)
-
-            full_path_on_deluge_system = os.path.join(norm_save_path, norm_file_path_in_torrent)
-
-            full_path_on_deluge_system = os.path.normpath(full_path_on_deluge_system)
-
-            relative_path = os.path.relpath(full_path_on_deluge_system, norm_deluge_base_remote_folder)
-
-            if ".." in relative_path.split(os.path.sep):
-                logger.warning(
-                    f"File '{full_path_on_deluge_system}' from torrent "
-                    f"appears to be outside the DELUGE_TORRENT_BASE_REMOTE_FOLDER "
-                    f"('{norm_deluge_base_remote_folder}'). "
-                    f"Relative path: '{relative_path}'. "
-                    f"This might lead to inconsistent tracking."
-                )
-
-            all_files.add(relative_path)
-            file_labels[relative_path] = label
-            file_torrent_ids[relative_path] = torrent_id
-
-    return all_files, file_labels, file_torrent_ids
+    return deluge_get_files(config)
 
 
 def load_hash_cache(cache_file: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Load file hash cache from a JSON file.
+    """Load file hash cache from a JSON file.
 
     Args:
-        cache_file (str): Path to the JSON cache file
+        cache_file: Path to the JSON cache file.
 
     Returns:
-        Dict[str, Dict[str, Any]]: Dictionary where keys are file paths and values are
-                                   dictionaries with 'hash', 'mtime', and 'size' fields
+        Dictionary where keys are file paths and values are
+        dictionaries with 'hash', 'mtime', and 'size' fields.
     """
     logger.debug(f"Loading cache from: {cache_file}")
     if os.path.exists(cache_file):
@@ -557,13 +603,15 @@ def load_hash_cache(cache_file: str) -> Dict[str, Dict[str, Any]]:
 
 
 def save_hash_cache(cache_file: str, hash_cache: Dict[str, Dict[str, Any]]) -> None:
-    """
-    Save file hash cache to a JSON file.
+    """Save file hash cache to a JSON file.
 
     Args:
-        cache_file (str): Path to the JSON cache file
-        hash_cache (Dict[str, Dict[str, Any]]): Dictionary where keys are file paths and values are
-                                              dictionaries with 'hash', 'mtime', and 'size' fields
+        cache_file: Path to the JSON cache file.
+        hash_cache: Dictionary where keys are file paths and values are
+            dictionaries with 'hash', 'mtime', and 'size' fields.
+            
+    Raises:
+        IOError: If there's an error writing to the cache file.
     """
     logger.debug(f"Saving {len(hash_cache)} entries to hash cache")
     try:
@@ -573,9 +621,8 @@ def save_hash_cache(cache_file: str, hash_cache: Dict[str, Dict[str, Any]]) -> N
         logger.error(f"Error saving cache: {str(e)}")
 
 
-def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = False) -> dict:
-    """
-    Scan a folder for files, get their metadata and hashes (using cache).
+def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Scan a folder for files, get their metadata and hashes (using cache).
 
     Uses a two-pass system:
     1. Pre-scan: Walks the directory, calls os.stat() once per file, and uses
@@ -585,13 +632,16 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
        if mtime matches, or calculates new hashes.
 
     Args:
-        folder (str): The folder to scan.
-        use_sqlite (bool): Whether to use SQLite for caching instead of JSON.
-        no_progress (bool): Whether to disable progress bars for this scan.
+        folder: The folder to scan.
+        use_sqlite: Whether to use SQLite for caching instead of JSON.
+        no_progress: Whether to disable progress bars for this scan.
 
     Returns:
-        dict: A dictionary where keys are relative file paths and values are
-              dictionaries with 'hash' and 'size' fields.
+        A dictionary where keys are relative file paths and values are
+        dictionaries with 'hash' and 'size' fields.
+        
+    Raises:
+        OSError: If there's an error accessing files or directories.
     """
     local_files = {}
     cache_file = None  # Initialize cache_file for potential use in JSON caching
@@ -621,7 +671,7 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
             full_path_str = os.path.join(root, file_name)
             try:
                 stat_result = os.stat(full_path_str)
-                if os.path.isfile(full_path_str) and should_process_file(Path(full_path_str), stat_result):
+                if os.path.isfile(full_path_str) and should_process_file(Path(full_path_str), stat_result, config):
                     paths_to_process_with_stats.append((full_path_str, stat_result))
             except FileNotFoundError:
                 logger.warning(f"File not found during pre-scan: {full_path_str}, skipping.")
@@ -725,152 +775,59 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
     return local_files
 
 
-def get_file_hash(file_path: Path, no_progress: bool = False) -> str:
-    """
-    Calculate MD5 hash of a file with optional progress bar.
+def find_orphaned_files(skip_media_check: bool = False, use_sqlite: bool = False, no_progress: bool = False) -> int:
+    """Find orphaned files by comparing Deluge files with local torrent and media folders.
+    
+    Scans local folders and Deluge client to identify orphaned files in three categories:
+    - Files in local torrent folder but not in Deluge (orphaned torrents)
+    - Files only in Deluge but not in the media folder
+    - Files only in the media folder but not in Deluge
 
     Args:
-        file_path (Path): Path to the file to hash
-        no_progress (bool): If True, disable progress bar
+        skip_media_check: Whether to skip checking the media folder.
+        use_sqlite: Whether to use SQLite for caching and save results only to the database.
+        no_progress: Whether to disable progress bars for this scan.
 
     Returns:
-        str: Hexadecimal MD5 hash of the file
-    """
-    md5_hash = hashlib.md5()
-    file_size = os.path.getsize(file_path)
-
-    chunk_size = 8 * 1024 * 1024
-
-    logger.debug(f"Calculating MD5 hash for: {file_path}")
-    with open(file_path, "rb") as f:
-        with tqdm(
-            total=file_size,
-            unit="B",
-            unit_scale=True,
-            desc=f"Hashing {Path(file_path).name}",
-            leave=False,
-            disable=no_progress,
-        ) as pbar:
-            while chunk := f.read(chunk_size):
-                md5_hash.update(chunk)
-                pbar.update(len(chunk))
-    return md5_hash.hexdigest()
-
-
-def find_orphaned_files(skip_media_check=False, use_sqlite=False, no_progress: bool = False) -> int:
-    """
-    Find orphaned files by comparing Deluge files with local torrent and media folders.
-
-    Args:
-        skip_media_check (bool): Whether to skip checking the media folder
-        use_sqlite (bool): Whether to use SQLite for caching and save results only to the database
-        no_progress (bool): Whether to disable progress bars for this scan
-
-    Returns:
-        int: The scan ID if saved to database, otherwise 0
+        The scan ID if saved to database, otherwise 0.
+        
+    Raises:
+        RuntimeError: If there's an error connecting to Deluge.
+        OSError: If there's an error accessing local files.
     """
     scan_start_time = datetime.now()
     scan_id = 0
 
-    try:
-        logger.info("Connecting to Deluge and getting file list...")
-        deluge_file_paths, file_labels, file_torrent_ids = get_deluge_files()
-        logger.info(f"Retrieved {len(deluge_file_paths)} files, their labels, and torrent IDs from Deluge client.")
+    # Modularised orphan calculation
+    orphaned_torrent_files, only_in_torrents, only_in_media = compute_orphans(
+        config=config,
+        skip_media_check=skip_media_check,
+        use_sqlite=use_sqlite,
+        no_progress=no_progress,
+    )
 
-        logger.info("Scanning local torrent folder...")
-        local_torrent_files = get_local_files(config.local_torrent_base_local_folder, use_sqlite, no_progress=no_progress)
-        logger.info(f"Found {len(local_torrent_files)} files in local torrent folder.")
+    logger.info(
+        "Orphan detection complete → {} torrent-folder orphans, {} only-in-torrent, {} only-in-media",
+        len(orphaned_torrent_files),
+        len(only_in_torrents),
+        len(only_in_media),
+    )
 
-        orphaned_torrent_files = [
-            {
-                "path": path,
-                "size": info["size"],
-                "size_human": (f"{info['size'] / (1024**3):.2f} GB" if info["size"] >= 1024**3 else f"{info['size'] / (1024**2):.2f} MB"),
-            }
-            for path, info in local_torrent_files.items()
-            if path not in deluge_file_paths
-        ]
-        # Sort by size
-        orphaned_torrent_files.sort(key=lambda x: x["size"], reverse=True)
+    # Save results regardless of whether orphans were found
+    logger.info(
+        "\nScan complete. Found {} orphans, {} files only in torrents, {} files only in media",
+        len(orphaned_torrent_files),
+        len(only_in_torrents),
+        len(only_in_media),
+    )
 
-        logger.info("Comparing files in deluge against files in the local torrent folder...")
-        logger.info((f"Found {len(orphaned_torrent_files)} orphaned files in torrent folder " f"(present locally, not in Deluge). Actions planned: Potential deletion after checks."))
-
-        if skip_media_check:
-            if orphaned_torrent_files:
-                logger.info(f"\nFound {len(orphaned_torrent_files)} orphans")
-                if use_sqlite:
-                    scan_id = save_scan_results_to_db(orphaned_torrent_files, [], [], scan_start_time)
-                else:
-                    save_scan_results(orphaned_torrent_files, [], [], scan_start_time)
-            else:
-                logger.info("\nNo orphaned files found.")
-            return scan_id
-
-        logger.info("Scanning local media folder...")
-        local_media_files = get_local_files(config.local_media_base_local_folder, use_sqlite, no_progress=no_progress)
-        logger.info(f"Found {len(local_media_files)} files in local media folder.")
-
-        # Compare files based on their hashes
-        # Exclude files in blacklisted subfolders and with blacklisted extensions
-        torrent_hashes = {
-            info["hash"]: (
-                name,
-                info["size"],
-                file_labels.get(name, "none"),
-                file_torrent_ids.get(name, None),  # Add torrent_id here
-            )
-            for name, info in local_torrent_files.items()
-            if not any(name.startswith(subfolder + "/") for subfolder in config.local_subfolders_blacklist)
-        }
-        media_hashes = {info["hash"]: (name, info["size"]) for name, info in local_media_files.items() if not any(name.startswith(subfolder + "/") for subfolder in config.local_subfolders_blacklist)}
-
-        # Pre-filter collections before set operations
-        torrent_set = frozenset(torrent_hashes.keys())
-        media_set = frozenset(media_hashes.keys())
-
-        only_in_torrents = [
-            {
-                "path": torrent_hashes[hash][0],
-                "label": torrent_hashes[hash][2],
-                "size": torrent_hashes[hash][1],
-                "size_human": (f"{torrent_hashes[hash][1] / (1024**3):.2f} GB" if torrent_hashes[hash][1] >= 1024**3 else f"{torrent_hashes[hash][1] / (1024**2):.2f} MB"),
-                "torrent_id": torrent_hashes[hash][3],
-            }
-            for hash in torrent_set - media_set
-        ]
-        only_in_torrents.sort(
-            key=lambda x: (
-                "a" if x["label"].startswith("other") else x["label"],
-                x["size"],
-            ),
-            reverse=True,
-        )
-
-        only_in_media = [
-            {
-                "path": media_hashes[hash][0],
-                "size": media_hashes[hash][1],
-                "size_human": (f"{media_hashes[hash][1] / (1024**3):.2f} GB" if media_hashes[hash][1] >= 1024**3 else f"{media_hashes[hash][1] / (1024**2):.2f} MB"),
-            }
-            for hash in media_set - torrent_set
-        ]
-        only_in_media.sort(key=lambda x: x["size"], reverse=True)
-
-        # Save results regardless of whether orphans were found
-        logger.info((f"\nScan complete. Found {len(orphaned_torrent_files)} orphans, " f"{len(only_in_torrents)} files only in torrents, " f"{len(only_in_media)} files only in media"))
-
-        if use_sqlite:
-            scan_id_from_db, _ = save_scan_results_to_db(orphaned_torrent_files, only_in_torrents, only_in_media, scan_start_time)
-            return scan_id_from_db
-        else:
-            save_scan_results(orphaned_torrent_files, only_in_torrents, only_in_media, scan_start_time)
-            # scan_id remains 0 if not use_sqlite (as initialized at the start of the function)
-            return scan_id
-
-    except KeyboardInterrupt:
-        logger.warning("\nOperation cancelled by user. Progress has been saved in the cache.")
-        return scan_id  # scan_id here is likely 0 from initialization
+    if use_sqlite:
+        scan_id_from_db, _ = save_scan_results_to_db(orphaned_torrent_files, only_in_torrents, only_in_media, scan_start_time)
+        return scan_id_from_db
+    else:
+        save_scan_results(orphaned_torrent_files, only_in_torrents, only_in_media, scan_start_time)
+        # scan_id remains 0 if not use_sqlite (as initialized at the start of the function)
+        return scan_id
 
 
 def save_scan_results_to_db(
@@ -1414,7 +1371,16 @@ def clean_hash_cache(folder: Path, use_sqlite=False) -> None:
     """
     # Get the current list of files in the folder
     current_files = set()
-    for root, _, files in os.walk(folder):
+    for root, dirs, files in os.walk(folder):
+
+        current_path = Path(root)
+        relative_root_path = current_path.relative_to(folder)
+
+        if relative_root_path.parts and relative_root_path.parts[0] in config.local_subfolders_blacklist:
+            logger.trace(f"Skipping blacklisted directory: {Path(folder) / relative_root_path.parts[0]} and all its subdirectories {dirs}.")
+            dirs[:] = []  # Don't descend into blacklisted directories
+            continue
+
         for file in files:
             full_path = os.path.join(root, file)
             relative_path = os.path.relpath(full_path, folder)
@@ -1432,11 +1398,10 @@ def clean_hash_cache(folder: Path, use_sqlite=False) -> None:
             # Get all entries for this folder
             cursor.execute(
                 """
-            SELECT relative_path FROM file_hashes WHERE folder_path = ?
-            """,
+                SELECT relative_path FROM file_hashes WHERE folder_path = ?;
+                """,
                 (str(folder),),
             )
-
             db_files = {row[0] for row in cursor.fetchall()}
             stale_files = db_files - current_files
 
@@ -1815,62 +1780,91 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
 
 def process_autoremove_labeling(
     db_path: Path,
-    client: DelugeRPCClient,
+    client: "DelugeRPCClient",
     apply_labels: bool,
     target_label_prefix: str = None,
 ) -> None:
     """
     Processes torrents that are only present on the torrents disk side (not in media)
-    and applies a target label (configured via DELUGE_AUTOREMOVE_LABEL) if they don't already have it.
-    This helps identify files that should be managed by the auto-remove plugin.
+    and identifies them for re-labeling with a target label (configured via DELUGE_AUTOREMOVE_LABEL)
+    after a delay period. This helps identify files that should be managed by the auto-remove plugin.
+    
+    Instead of applying labels directly, this function records pending actions in the database
+    that will be executed after the configured delay period (RELABEL_ACTION_DELAY_DAYS).
 
     Args:
         db_path (Path): Path to the SQLite database.
         client (DelugeRPCClient): An active Deluge RPC client instance.
-        apply_labels (bool): If True, actually apply labels. Otherwise, dry run.
+        apply_labels (bool): If True, record pending actions. Otherwise, dry run.
         target_label_prefix (str): The prefix of the label to apply. If None, uses config.deluge_autoremove_label.
     """
 
     if target_label_prefix is None:
         target_label_prefix = config.deluge_autoremove_label
-    files_to_process_from_view = []
+        
+    # Get latest scan ID for recording as the originating scan
+    latest_scan_id = None
     try:
         with sqlite3.connect(str(db_path)) as conn:
             cursor = conn.cursor()
-            # Columns from view: file_path, current_label, torrent_id
-            cursor.execute("SELECT file_path, current_label, torrent_id FROM vw_autoremove_candidates_latest_scan;")
+            cursor.execute("SELECT id FROM scan_results ORDER BY created_at DESC LIMIT 1;")
+            row = cursor.fetchone()
+            if row:
+                latest_scan_id = row[0]
+            else:
+                logger.error("No scan results found in database. Cannot record pending actions.")
+                return
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error fetching latest scan ID: {e}")
+        return
+        
+    files_to_process = []
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            cursor = conn.cursor()
+            # Updated query to use the view with size_human field
+            cursor.execute(
+                "SELECT file_id, file_path, current_label, torrent_id, size_human FROM vw_autoremove_candidates_latest_scan;"
+            )
             for row in cursor.fetchall():
-                files_to_process_from_view.append(
-                    {
-                        "path": row[0],
-                        "label": row[1],
-                        "torrent_id": row[2],
-                    }
-                )
+                files_to_process.append({
+                    "file_id": row[0],
+                    "path": row[1],
+                    "label": row[2],
+                    "torrent_id": row[3],
+                    "size_human": row[4],
+                })
     except sqlite3.Error as e:
         logger.error(f"SQLite error fetching candidates for '{target_label_prefix}' labeling: {e}")
         return
 
-    if not files_to_process_from_view:
+    if not files_to_process:
         logger.info(f"No torrents found needing the '{target_label_prefix}' label based on the latest scan data.")
         return
 
-    # The view already filters out torrents that have the target_label_prefix.
-    # So, files_to_process_from_view contains only those needing the label.
-    files_to_process = files_to_process_from_view
+    # Calculate the due date for the actions
+    action_due_at = datetime.utcnow() + timedelta(days=config.relabel_action_delay_days)
+    action_due_at_str = action_due_at.isoformat()
+    
     logger.info(f"Found {len(files_to_process)} torrents to potentially label with '{target_label_prefix}'.")
 
     processed_torrent_hashes = set()
-    label_applied_count = 0
-    label_would_be_applied_count = 0
+    actions_recorded_count = 0
+    actions_would_be_recorded_count = 0
 
     for item in files_to_process:
+        orphaned_file_id = item.get("file_id")
         torrent_id = item.get("torrent_id")
         current_label = item.get("label", "")
         file_path = item.get("path", "Unknown path")
+        size_human = item.get("size_human", "Unknown size")
 
         if not torrent_id:
             logger.warning(f"Item for path '{file_path}' missing 'torrent_id', skipping labeling.")
+            continue
+            
+        if not orphaned_file_id:
+            logger.warning(f"Item for path '{file_path}' missing 'file_id', skipping labeling.")
             continue
 
         if torrent_id in processed_torrent_hashes:
@@ -1883,25 +1877,204 @@ def process_autoremove_labeling(
             logger.debug(f"Torrent ID {torrent_id} (file: {file_path}) already has label '{current_label}' starting with '{target_label_prefix}'. Skipping.")
             continue
 
-        new_label = target_label_prefix  # Simple case, could be made more complex e.g., {label}.tv or {label}.movie
-        # For now, we'll use a generic label. If specific categories are needed,
-        # this logic would need to determine the content type.
-
+        # The proposed action is always to relabel the torrent with the target prefix
+        proposed_action = "RELABEL_OTHERCAT"
+        
         if apply_labels:
             try:
-                client.label.set_torrent(torrent_id, new_label)
-                logger.info(f"Applied label '{new_label}' to torrent ID {torrent_id} (file: {file_path}). Previous label: '{current_label}'.")
-                label_applied_count += 1
-            except Exception as e:
-                logger.error(f"Error applying label '{new_label}' to torrent ID {torrent_id} (file: {file_path}): {e}")
+                with sqlite3.connect(str(db_path)) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        INSERT INTO pending_actions
+                        (orphaned_file_id, torrent_id, file_path, current_label, proposed_action, 
+                         action_details, size_human, scan_id_identified, identified_at, action_due_at, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, 'pending')
+                        """,
+                        (
+                            orphaned_file_id, 
+                            torrent_id, 
+                            file_path, 
+                            current_label, 
+                            proposed_action, 
+                            target_label_prefix,  # action_details contains the target label
+                            size_human, 
+                            latest_scan_id, 
+                            action_due_at_str
+                        ),
+                    )
+                    conn.commit()
+                    logger.info(f"Recorded pending action to apply label '{target_label_prefix}' to torrent ID {torrent_id} (file: {file_path}) on {action_due_at.strftime('%Y-%m-%d')}. Previous label: '{current_label}'.")
+                    actions_recorded_count += 1
+            except sqlite3.Error as e:
+                logger.error(f"SQLite error recording pending action for torrent ID {torrent_id} (file: {file_path}): {e}")
         else:
-            logger.info(f"[DRY RUN] Would apply label '{new_label}' to torrent ID {torrent_id} (file: {file_path}). Previous label: '{current_label}'.")
-            label_would_be_applied_count += 1
+            # Dry run - just log what would happen
+            logger.info(f"[DRY RUN] Would record pending action to apply label '{target_label_prefix}' to torrent ID {torrent_id} (file: {file_path}) on {action_due_at.strftime('%Y-%m-%d')}. Previous label: '{current_label}'.")
+            actions_would_be_recorded_count += 1
 
     if apply_labels:
-        logger.info(f"Finished processing labels. Applied '{target_label_prefix}' to {label_applied_count} torrents.")
+        logger.info(f"Finished processing labels. Recorded {actions_recorded_count} pending actions to apply '{target_label_prefix}' after {config.relabel_action_delay_days} days.")
     else:
-        logger.info(f"Finished processing labels (dry run). Would have applied '{target_label_prefix}' to {label_would_be_applied_count} torrents.")
+        logger.info(f"Finished processing labels (dry run). Would have recorded {actions_would_be_recorded_count} pending actions to apply '{target_label_prefix}' after {config.relabel_action_delay_days} days.")
+
+
+def execute_pending_actions(
+    db_path: Path,
+    client: "DelugeRPCClient",
+    dry_run: bool = False,
+) -> None:
+    """
+    Process pending actions that are due for execution.
+    
+    Checks the pending_actions table for actions where action_due_at has passed
+    and executes them based on their proposed_action type. Currently supports
+    RELABEL_OTHERCAT action type for applying labels to torrents.
+    
+    Args:
+        db_path (Path): Path to the SQLite database.
+        client (DelugeRPCClient): An active Deluge RPC client instance.
+        dry_run (bool): If True, only simulate the execution without actually making changes.
+    """
+    # Get latest scan ID for recording as the processing scan
+    latest_scan_id = None
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM scan_results ORDER BY created_at DESC LIMIT 1;")
+            row = cursor.fetchone()
+            if row:
+                latest_scan_id = row[0]
+            else:
+                logger.error("No scan results found in database. Cannot process pending actions.")
+                return
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error fetching latest scan ID: {e}")
+        return
+    
+    # Get all due pending actions
+    pending_actions = []
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, orphaned_file_id, torrent_id, file_path, current_label, 
+                       proposed_action, action_details, size_human, identified_at, action_due_at
+                FROM pending_actions
+                WHERE status = 'pending' AND action_due_at <= datetime('now');
+                """
+            )
+            for row in cursor.fetchall():
+                pending_actions.append({
+                    "id": row[0],
+                    "orphaned_file_id": row[1],
+                    "torrent_id": row[2],
+                    "file_path": row[3],
+                    "current_label": row[4] or "",
+                    "proposed_action": row[5],
+                    "action_details": row[6],
+                    "size_human": row[7],
+                    "identified_at": row[8],
+                    "action_due_at": row[9]
+                })
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error fetching pending actions: {e}")
+        return
+    
+    if not pending_actions:
+        logger.info("No pending actions are currently due for processing.")
+        return
+        
+    logger.info(f"Found {len(pending_actions)} pending actions that are due for processing.")
+    
+    # Process each pending action
+    for action in pending_actions:
+        action_id = action["id"]
+        torrent_id = action["torrent_id"]
+        file_path = action["file_path"]
+        current_label = action["current_label"]
+        proposed_action = action["proposed_action"]
+        action_details = action["action_details"]
+        size_human = action["size_human"]
+        
+        if proposed_action == "RELABEL_OTHERCAT":
+            new_label = action_details
+            
+            # Check if the torrent still exists in Deluge
+            try:
+                torrent_exists = False
+                try:
+                    # Try to get the torrent status to check if it exists
+                    status = client.core.get_torrent_status(torrent_id, ["name"])
+                    torrent_exists = bool(status)  # Will be empty dict if torrent doesn't exist
+                except Exception as e:
+                    logger.warning(f"Error checking if torrent ID {torrent_id} exists: {e}")
+                    torrent_exists = False
+                    
+                if not torrent_exists:
+                    if not dry_run:
+                        with sqlite3.connect(str(db_path)) as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                """
+                                UPDATE pending_actions
+                                SET status = 'failed', scan_id_processed = ?, processed_at = datetime('now'),
+                                    processing_notes = 'Torrent no longer exists in Deluge'
+                                WHERE id = ?;
+                                """,
+                                (latest_scan_id, action_id)
+                            )
+                            conn.commit()
+                    logger.warning(f"Cannot apply label '{new_label}' to torrent ID {torrent_id} (file: {file_path}) as it no longer exists in Deluge.")
+                    continue
+                    
+                # Apply the label if not dry run
+                if not dry_run:
+                    try:
+                        client.label.set_torrent(torrent_id, new_label)
+                        
+                        # Update the pending action as completed
+                        with sqlite3.connect(str(db_path)) as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                """
+                                UPDATE pending_actions
+                                SET status = 'completed', scan_id_processed = ?, processed_at = datetime('now'),
+                                    processing_notes = ?
+                                WHERE id = ?;
+                                """,
+                                (latest_scan_id, f"Applied label '{new_label}'. Previous label: '{current_label}'", action_id)
+                            )
+                            conn.commit()
+                        logger.info(f"Applied label '{new_label}' to torrent ID {torrent_id} (file: {file_path}). Previous label: '{current_label}'.")
+                    except Exception as e:
+                        # Update the pending action as failed
+                        with sqlite3.connect(str(db_path)) as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                """
+                                UPDATE pending_actions
+                                SET status = 'failed', scan_id_processed = ?, processed_at = datetime('now'),
+                                    processing_notes = ?
+                                WHERE id = ?;
+                                """,
+                                (latest_scan_id, f"Error applying label: {str(e)}", action_id)
+                            )
+                            conn.commit()
+                        logger.error(f"Error applying label '{new_label}' to torrent ID {torrent_id} (file: {file_path}): {e}")
+                else:
+                    logger.info(f"[DRY RUN] Would apply label '{new_label}' to torrent ID {torrent_id} (file: {file_path}). Previous label: '{current_label}'.")
+            except Exception as e:
+                logger.error(f"Unexpected error processing pending action ID {action_id} for torrent ID {torrent_id}: {e}")
+        else:
+            logger.warning(f"Unsupported action type '{proposed_action}' for pending action ID {action_id}. Skipping.")
+    
+    # Log summary of processed actions
+    if dry_run:
+        logger.info(f"[DRY RUN] Would have processed {len(pending_actions)} pending actions.")
+    else:
+        logger.info(f"Successfully processed {len(pending_actions)} pending actions.")
 
 
 def main() -> None:
@@ -1918,52 +2091,107 @@ def main() -> None:
     """
     print_version_info()
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--clean-cache",
-        action="store_true",
-        help="Clean the hash cache by removing entries for files that no longer exist",
+    # Create parser with description and version info
+    parser = argparse.ArgumentParser(
+        description="Deluge Orphaned Files - Find and manage orphaned torrent files",
+        epilog="For more information, visit https://github.com/FiveBoroughs/deluge-orphaned-files"
     )
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--trace", action="store_true", help="Enable trace logging")
-    parser.add_argument(
+    parser.add_argument('-v', '--version', action='version', version=f'%(prog)s {__version__}')
+    
+    # Organize arguments into logical groups
+    scan_group = parser.add_argument_group('Scanning Options')
+    scan_group.add_argument(
         "--skip-media-check",
         action="store_true",
         help="Only check Deluge vs local torrent files (skip media folder comparison)",
     )
-    parser.add_argument(
+    scan_group.add_argument(
+        "--no-progress", 
+        action="store_true", 
+        help="Disable progress bars during scan operations"
+    )
+    
+    # Storage options group
+    storage_group = parser.add_argument_group('Storage Options')
+    storage_group.add_argument(
         "--sqlite",
         action="store_true",
         help="Use SQLite for caching and save results to database instead of JSON",
     )
-    parser.add_argument(
+    storage_group.add_argument(
         "--migrate-to-sqlite",
         dest="migrate_to_sqlite",
         action="store_true",
         help="Migrate data from JSON hash caches to SQLite database",
     )
-    parser.add_argument("--list-scans", action="store_true", help="List all previous scans")
-    parser.add_argument("--scan-id", type=int, help="Show results for a specific scan ID")
-    parser.add_argument(
+    storage_group.add_argument(
+        "--clean-cache",
+        action="store_true",
+        help="Clean the hash cache by removing entries for files that no longer exist",
+    )
+    
+    # Results and reporting group
+    results_group = parser.add_argument_group('Results & Reporting')
+    results_group.add_argument(
+        "--list-scans", 
+        action="store_true", 
+        help="List all previous scans with IDs and timestamps"
+    )
+    results_group.add_argument(
+        "--scan-id", 
+        type=int, 
+        help="Show detailed results for a specific scan ID"
+    )
+    results_group.add_argument(
+        "--show-last", 
+        action="store_true", 
+        help="Show results for the most recent scan"
+    )
+    results_group.add_argument(
         "--limit",
         type=int,
         default=10,
         help="Limit the number of scans to show when listing (default: 10)",
     )
-    parser.add_argument("--no-progress", action="store_true", help="Disable progress bars")
-    parser.add_argument(
+    
+    # File management group
+    file_group = parser.add_argument_group('File Management')
+    file_group.add_argument(
         "--force",
         dest="force",
         action="store_true",
-        help="Actually delete files marked for deletion (dangerous, use with caution)",
+        help="Actually delete files marked for deletion (DANGEROUS: use with caution)",
     )
-    parser.add_argument(
+    file_group.add_argument(
         "--apply-autoremove-labels",
         action="store_true",
-        help="Apply '{}' label in Deluge to torrents found only on torrent disk (not in media) "
-        "and not already labeled as such. Dry run if not specified but items exist.".format(config.deluge_autoremove_label),
+        help=f"Apply '{config.deluge_autoremove_label}' label in Deluge to torrents found only on torrent disk "
+        "(not in media) and not already labeled as such. Performs a dry run if not specified.",
     )
-    parser.add_argument("--show-last", action="store_true", help="Show results for the most recent scan")
+    file_group.add_argument(
+        "--execute-pending-actions",
+        action="store_true",
+        help="Execute pending actions that are due (e.g., apply deferred labels). Use with --force to actually apply changes.",
+    )
+    
+    # Notification testing group
+    notification_group = parser.add_argument_group('Notification Testing')
+    notification_group.add_argument(
+        "--test-email",
+        action="store_true",
+        help="Send a test e-mail using configured SMTP settings and exit",
+    )
+    notification_group.add_argument(
+        "--test-telegram",
+        action="store_true",
+        help="Send a test Telegram message using configured bot token / chat ID and exit",
+    )
+    
+    # Logging options
+    log_group = parser.add_argument_group('Logging Options')
+    log_group.add_argument("--debug", action="store_true", help="Enable debug logging")
+    log_group.add_argument("--trace", action="store_true", help="Enable trace logging (most verbose)")
+    
     args = parser.parse_args()
 
     if args.debug:
@@ -2000,6 +2228,43 @@ def main() -> None:
     if args.sqlite:
         logger.debug(f"Initializing SQLite database schema at {config.sqlite_cache_path}")
         init_sqlite_cache(str(config.sqlite_cache_path))
+
+    # -----------------------------------------------------------------------
+    # Test e-mail shortcut
+    # -----------------------------------------------------------------------
+    if args.test_email:
+        if config.smtp_host and config.smtp_username and config.smtp_password and config.smtp_from_addr and config.smtp_to_addrs:
+            test_body = (
+                "This is a test e-mail from Deluge Orphaned Files.\n\n" f"Timestamp: {datetime.now().isoformat(timespec='seconds')}\n" "If you received this, SMTP settings are working correctly."
+            )
+            send_scan_report(
+                smtp_host=config.smtp_host,
+                smtp_port=config.smtp_port,
+                username=config.smtp_username,
+                password=config.smtp_password,
+                from_addr=config.smtp_from_addr,
+                to_addrs=config.smtp_to_addrs,
+                report_body=test_body,
+                use_ssl=config.smtp_use_ssl,
+            )
+        else:
+            logger.error("Cannot send test e-mail: incomplete SMTP configuration (check SMTP_* env vars).")
+        return
+
+    # Telegram test
+    if args.test_telegram:
+        if config.telegram_bot_token and config.telegram_chat_id:
+            test_body = (
+                "*Deluge Orphaned Files* – Telegram test message\n\n" f"Timestamp: {datetime.now().isoformat(timespec='seconds')}\n" "If you received this, Telegram settings are working correctly."
+            )
+            send_telegram_report(
+                bot_token=config.telegram_bot_token,
+                chat_id=config.telegram_chat_id,
+                report_body=test_body,
+            )
+        else:
+            logger.error("Cannot send test Telegram message: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured.")
+        return
 
     if args.show_last or args.scan_id is not None:
         if not args.sqlite:
@@ -2041,15 +2306,28 @@ def main() -> None:
             clean_hash_cache(config.local_media_base_local_folder, use_sqlite=True)
         return
 
-    scan_id = find_orphaned_files(skip_media_check=args.skip_media_check, use_sqlite=True, no_progress=args.no_progress)
+    # Run the scan using the storage mode chosen by the user (--sqlite flag)
+    scan_id = find_orphaned_files(
+        skip_media_check=args.skip_media_check,
+        use_sqlite=args.sqlite,
+        no_progress=args.no_progress,
+    )
 
+    # Handle auto-remove labels or pending actions if requested
     if args.apply_autoremove_labels:
         logger.info(f"Attempting to apply '{config.deluge_autoremove_label}' labels to eligible torrents based on the latest scan...")
     else:
         logger.info(f"Performing dry-run for '{config.deluge_autoremove_label}' labeling. Use --apply-autoremove-labels to apply changes.")
+        
+    if args.execute_pending_actions:
+        logger.info("Processing pending actions that are due for execution...")
+    else:
+        logger.info("Skipping processing of pending actions. Use --execute-pending-actions to check and execute pending actions.")
 
     deluge_client = None
     try:
+        from deluge_client import DelugeRPCClient
+
         deluge_client = DelugeRPCClient(
             host=config.deluge_host,
             port=config.deluge_port,
@@ -2065,6 +2343,17 @@ def main() -> None:
                 apply_labels=args.apply_autoremove_labels,
                 target_label_prefix=config.deluge_autoremove_label,
             )
+            
+            # Execute pending actions if requested
+            if args.execute_pending_actions:
+                execute_pending_actions(
+                    db_path=config.sqlite_cache_path,
+                    client=deluge_client,
+                    dry_run=not args.force,
+                )
+                if not args.force:
+                    logger.info("Pending actions were only processed in dry-run mode. Use --force to actually apply changes.")
+
         else:
             logger.error(f"Failed to connect to Deluge for labeling. Skipping '{config.deluge_autoremove_label}' labeling.")
     except ConnectionRefusedError:
@@ -2087,6 +2376,63 @@ def main() -> None:
         logger.info(f"Scan results saved to {config.output_file}")
         logger.info("Deletion processing (--force) is only available with --sqlite mode.")
 
+    # Send e-mail notification if SMTP is configured and we have a valid scan_id
+    if scan_id > 0 and config.smtp_host and config.smtp_username and config.smtp_password and config.smtp_from_addr and config.smtp_to_addrs:
+        logger.info("Preparing e-mail report …")
+        report_body = _format_scan_results(config.sqlite_cache_path, scan_id=scan_id)
+        send_scan_report(
+            smtp_host=config.smtp_host,
+            smtp_port=config.smtp_port,
+            username=config.smtp_username,
+            password=config.smtp_password,
+            from_addr=config.smtp_from_addr,
+            to_addrs=config.smtp_to_addrs,
+            report_body=report_body,
+            use_ssl=config.smtp_use_ssl,
+        )
+    else:
+        logger.debug("SMTP configuration incomplete or e-mail disabled; skipping notification.")
+
+    # Telegram notification
+    if scan_id > 0 and config.telegram_bot_token and config.telegram_chat_id:
+        report_body = _format_scan_results(config.sqlite_cache_path, scan_id=scan_id)
+        send_telegram_report(
+            bot_token=config.telegram_bot_token,
+            chat_id=config.telegram_chat_id,
+            report_body=report_body,
+        )
+    else:
+        logger.debug("Telegram configuration incomplete or notification disabled; skipping notification.")
+
+    # Only show the formatted table from the database when using SQLite mode
+    if scan_id > 0:
+        try:
+            summary_table = _format_scan_results(config.sqlite_cache_path, scan_id=scan_id)
+            logger.info("\n{}", summary_table)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to generate console summary table: {}", exc)
+
+    logger.debug("Telegram configuration incomplete or notification disabled; skipping notification.")
+
 
 if __name__ == "__main__":
     main()
+
+# Rebind helper functions from scanning module to override legacy definitions below
+get_local_files = _scan_get_local_files  # type: ignore  # noqa: F401,F811
+load_hash_cache = scan_load_hash_cache  # type: ignore  # noqa: F401,F811
+save_hash_cache = scan_save_hash_cache  # type: ignore  # noqa: F401,F811
+load_hashes_from_sqlite = scan_load_hashes_from_sqlite  # type: ignore  # noqa: F401,F811
+
+# Override database hash helpers too (gradual deprecation of local copies)
+init_sqlite_cache = db_init_sqlite_cache  # type: ignore  # noqa: F401,F811
+load_hashes_from_sqlite = db_load_hashes_from_sqlite  # type: ignore  # noqa: F401,F811
+upsert_hash_to_sqlite = db_upsert_hash_to_sqlite  # type: ignore  # noqa: F401,F811
+
+# Rebind Deluge wrapper
+get_deluge_files = deluge_get_files  # type: ignore  # noqa: F401,F811
+
+# Rebind retention helpers (override legacy in this file)
+get_files_to_mark_for_deletion = retention_get_files_to_mark  # type: ignore  # noqa: F401,F811
+get_files_to_actually_delete = retention_get_files_to_delete  # type: ignore  # noqa: F401,F811
+process_deletions = retention_process_deletions  # type: ignore  # noqa: F401,F811

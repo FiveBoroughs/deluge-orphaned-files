@@ -4,3 +4,5 @@ tqdm
 loguru
 pydantic
 pydantic-settings
+requests
+prettytable

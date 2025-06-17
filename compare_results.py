@@ -15,11 +15,14 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Constants
-DEFAULT_JSON_PATH = "orphaned_files.json"
-
-# Load environment variables from .env file
+# Load environment variables from .env file first so env vars are available
 load_dotenv()
+
+# Determine JSON path from environment (OUTPUT_FILE from main app) but fallback to orphaned_files.json
+OUTPUT_FILE_ENV = os.getenv("OUTPUT_FILE")
+DEFAULT_JSON_PATH = OUTPUT_FILE_ENV if OUTPUT_FILE_ENV else "orphaned_files.json"
+if OUTPUT_FILE_ENV:
+    logger.info(f"Using JSON results path from OUTPUT_FILE: {DEFAULT_JSON_PATH}")
 
 # Get the local torrent folder path from environment variable
 LOCAL_TORRENT_BASE_LOCAL_FOLDER = os.getenv("LOCAL_TORRENT_BASE_LOCAL_FOLDER")
@@ -28,14 +31,18 @@ if LOCAL_TORRENT_BASE_LOCAL_FOLDER:
 else:
     logger.warning("LOCAL_TORRENT_BASE_LOCAL_FOLDER not found in environment variables")
 
-# Set the database path based on the environment variable
-if LOCAL_TORRENT_BASE_LOCAL_FOLDER:
+# Determine database path from environment variables
+SQLITE_CACHE_PATH_ENV = os.getenv("APP_SQLITE_CACHE_PATH")
+if SQLITE_CACHE_PATH_ENV:  # Highest priority – explicit cache path provided
+    DEFAULT_SQLITE_PATH = SQLITE_CACHE_PATH_ENV
+    logger.info(f"Using database path from APP_SQLITE_CACHE_PATH: {DEFAULT_SQLITE_PATH}")
+elif LOCAL_TORRENT_BASE_LOCAL_FOLDER:  # Derive path from torrent folder as a fallback
     DEFAULT_SQLITE_PATH = os.path.join(os.path.dirname(LOCAL_TORRENT_BASE_LOCAL_FOLDER), ".file_cache.sqlite")
-    logger.info(f"Using database path from .env: {DEFAULT_SQLITE_PATH}")
+    logger.info(f"Using database path derived from LOCAL_TORRENT_BASE_LOCAL_FOLDER: {DEFAULT_SQLITE_PATH}")
 else:
-    # Fallback to a default location
+    # Ultimate fallback to current working directory
     DEFAULT_SQLITE_PATH = ".file_cache.sqlite"
-    logger.warning((f"LOCAL_TORRENT_BASE_LOCAL_FOLDER not found in .env, " f"using default database path: {DEFAULT_SQLITE_PATH}"))
+    logger.warning(("Neither APP_SQLITE_CACHE_PATH nor LOCAL_TORRENT_BASE_LOCAL_FOLDER found in environment; " f"using default database path: {DEFAULT_SQLITE_PATH}"))
 
 
 def load_json_results(json_path):
@@ -287,7 +294,11 @@ def compare_results(json_data, sql_data, output_file=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Compare orphaned_files.json with SQL database results")
-    parser.add_argument("--json_path", default=DEFAULT_JSON_PATH, help="Path to the JSON results file")
+    parser.add_argument(
+        "--json_path",
+        default=DEFAULT_JSON_PATH,
+        help="Path to the JSON results file (defaults to OUTPUT_FILE env var or orphaned_files.json)",
+    )
     parser.add_argument(
         "--db_path",
         default=DEFAULT_SQLITE_PATH,
