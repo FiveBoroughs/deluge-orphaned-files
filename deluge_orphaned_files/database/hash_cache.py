@@ -49,10 +49,10 @@ _SCHEMA_INDEX_FOLDER_PATH = "CREATE INDEX IF NOT EXISTS idx_file_hashes_folder_p
 
 def init_sqlite_cache(db_path: str | Path) -> None:
     """Create database and required tables if they do not exist.
-    
+
     Args:
         db_path: Path to the SQLite database file.
-        
+
     Raises:
         sqlite3.Error: If there's an error creating the schema.
     """
@@ -75,15 +75,15 @@ def init_sqlite_cache(db_path: str | Path) -> None:
 
 def load_hashes_from_sqlite(db_path: str | Path, folder_path: Path) -> Dict[str, Dict[str, Any]]:
     """Load cached file hashes for a specific folder from the database.
-    
+
     Args:
         db_path: Path to the SQLite database file.
         folder_path: The folder whose file hashes should be retrieved.
-        
+
     Returns:
         Dictionary where keys are relative file paths and values are
         dictionaries containing 'hash', 'mtime', and 'size' fields.
-        
+
     Raises:
         sqlite3.Error: If there's an error querying the database.
     """
@@ -130,7 +130,7 @@ def upsert_hash_to_sqlite(
     file_size: int,
 ) -> None:
     """Insert or update a file hash record in the database.
-    
+
     Args:
         db_path: Path to the SQLite database file.
         folder_path: Absolute path of the folder containing the file.
@@ -138,7 +138,7 @@ def upsert_hash_to_sqlite(
         file_hash: MD5 hash of the file content.
         mtime: File's modification timestamp.
         file_size: Size of the file in bytes.
-        
+
     Raises:
         sqlite3.Error: If there's an error updating the database.
     """

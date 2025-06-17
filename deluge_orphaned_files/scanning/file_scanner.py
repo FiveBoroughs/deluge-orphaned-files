@@ -110,11 +110,11 @@ def load_hash_cache(cache_file: Path) -> dict[str, dict[str, object]]:
 
 def save_hash_cache(cache_file: Path, hash_cache: dict[str, dict[str, object]]) -> None:  # noqa: D401 – simple util
     """Save hash cache data to a JSON file.
-    
+
     Args:
         cache_file: Path where the cache will be saved.
         hash_cache: Dictionary of hash data to persist.
-        
+
     Raises:
         Exception: Any error that occurs during saving.
     """
@@ -129,7 +129,7 @@ def save_hash_cache(cache_file: Path, hash_cache: dict[str, dict[str, object]]) 
 
 def _upsert_hash_to_sqlite(conn: sqlite3.Connection, folder_path: Path, relative_path: str, file_hash: str, mtime: float, file_size: int) -> None:  # noqa: D401 – internal util
     """Insert or replace a row in the file_hashes table.
-    
+
     Args:
         conn: SQLite database connection.
         folder_path: Absolute path of the scanned folder.
@@ -156,20 +156,20 @@ def get_local_files(
     no_progress: bool = False,
 ) -> dict[str, dict[str, object]]:
     """Scan a folder and build a mapping of file paths to hash/size information.
-    
+
     Uses a two-phase approach: first gathering eligible files, then processing
     them with support for caching to avoid rehashing unchanged files.
-    
+
     Args:
         folder: The directory to scan.
         config: Configuration object implementing AppConfigLike protocol.
         use_sqlite: Whether to use SQLite for hash caching instead of JSON.
         no_progress: Whether to disable progress bars for this scan.
-        
+
     Returns:
         Dictionary where keys are relative file paths and values are
         dictionaries containing 'hash' and 'size' fields.
-        
+
     Raises:
         FileNotFoundError: If files disappear during scanning.
         sqlite3.Error: If using SQLite and database operations fail.

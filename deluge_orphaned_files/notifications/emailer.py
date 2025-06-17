@@ -11,7 +11,6 @@ import smtplib
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from datetime import datetime
-from typing import List, Dict, Any
 
 from loguru import logger
 
@@ -20,13 +19,13 @@ __all__ = ["send_scan_report"]
 
 def _build_message(subject: str, body: str, from_addr: str, to_addrs: list[str]) -> EmailMessage:
     """Build an email message with proper headers.
-    
+
     Args:
         subject: Email subject line.
         body: Plain text email body content.
         from_addr: Sender email address.
         to_addrs: List of recipient email addresses.
-        
+
     Returns:
         EmailMessage: Properly formatted email message object.
     """
@@ -42,10 +41,10 @@ def _build_message(subject: str, body: str, from_addr: str, to_addrs: list[str])
 
 def send_scan_report(*, smtp_host: str, smtp_port: int, username: str, password: str, from_addr: str, to_addrs: list[str], report_body: str, use_ssl: bool = True) -> None:
     """Send scan report via SMTP.
-    
+
     All parameters except use_ssl are mandatory. If any error occurs during sending,
     it is logged but not raised, to avoid breaking the main process.
-    
+
     Args:
         smtp_host: SMTP server hostname or IP address.
         smtp_port: SMTP server port number.

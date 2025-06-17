@@ -30,7 +30,7 @@ def get_file_hash(file_path: Path, no_progress: bool = False) -> str:  # noqa: D
 
     Returns:
         32-character hexadecimal MD5 digest.
-        
+
     Raises:
         FileNotFoundError: If the specified file does not exist.
         PermissionError: If the file cannot be read due to permissions.

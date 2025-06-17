@@ -32,20 +32,20 @@ __all__ = [
 
 def get_files_to_mark_for_deletion(db_path: Path) -> List[Dict[str, Any]]:
     """Get files eligible for deletion based on configured criteria.
-    
+
     Queries the database view view_files_eligible_for_deletion which filters files based on:
     - source = 'local_torrent_folder'
     - status = 'active'
     - consecutive_scans ≥ threshold (configured when view was created)
     - days between first_seen / last_seen ≥ threshold
-    
+
     Args:
         db_path: Path to the SQLite database file.
-        
+
     Returns:
         List of dictionaries containing eligible file information including id, path,
         size, days seen difference, and consecutive scans count.
-        
+
     Raises:
         sqlite3.Error: If there's an error querying the database.
     """
@@ -77,13 +77,13 @@ def get_files_to_mark_for_deletion(db_path: Path) -> List[Dict[str, Any]]:
 
 def get_files_to_actually_delete(db_path: Path) -> List[Dict[str, Any]]:
     """Get files that have already been marked for deletion.
-    
+
     Args:
         db_path: Path to the SQLite database file.
-        
+
     Returns:
         List of dictionaries containing file IDs and paths for files marked for deletion.
-        
+
     Raises:
         sqlite3.Error: If there's an error querying the database.
     """
@@ -109,10 +109,10 @@ def get_files_to_actually_delete(db_path: Path) -> List[Dict[str, Any]]:
 
 def process_deletions(*, force_delete: bool, db_path: Path, torrent_base_folder: Path) -> None:
     """Process file deletions based on retention policy.
-    
+
     Either marks eligible files for deletion or performs actual deletion of
     previously marked files, depending on the force_delete parameter.
-    
+
     Args:
         force_delete: If True, delete files previously marked. Otherwise, do a dry-run
             and mark eligible files for future deletion.
@@ -137,14 +137,14 @@ def process_deletions(*, force_delete: bool, db_path: Path, torrent_base_folder:
 
 def _delete_marked_files(*, db_path: Path, torrent_base_folder: Path) -> None:
     """Delete files that are currently active torrent orphans.
-    
+
     Fetches orphaned files from the database and physically deletes them from disk,
     then updates their status in the database to 'deleted'.
-    
+
     Args:
         db_path: Path to the SQLite database.
         torrent_base_folder: Base directory where torrent files are stored.
-        
+
     Raises:
         sqlite3.Error: If there's an error accessing the database.
     """
@@ -204,13 +204,13 @@ def _delete_marked_files(*, db_path: Path, torrent_base_folder: Path) -> None:
 
 def _mark_new_eligible_files(db_path: Path) -> None:
     """Mark eligible files for future deletion.
-    
+
     Identifies files that meet deletion criteria and updates their status in the
     database to 'marked_for_deletion' without actually removing them.
-    
+
     Args:
         db_path: Path to the SQLite database.
-        
+
     Raises:
         sqlite3.Error: If there's an error updating the database.
     """

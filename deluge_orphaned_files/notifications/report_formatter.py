@@ -20,7 +20,7 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
         db_path: Path to the SQLite database.
         scan_id: If given, show that specific scan; otherwise shows the most recent scan.
         limit: How many recent scans to look back if scan_id is None (currently only the first is used).
-        
+
     Returns:
         str: Formatted text report containing scan information and result tables.
     """
@@ -97,26 +97,26 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
         f"Scan End: {scan_end}",
         "",
     ]
-    
+
     result = "\n".join(header_lines) + table.get_string()
-    
+
     # Add pending actions section
     try:
         with sqlite3.connect(str(db_path)) as conn:
             cursor = conn.cursor()
-            
+
             # Check if the pending_actions table exists
             cursor.execute(
-                """SELECT name FROM sqlite_master 
+                """SELECT name FROM sqlite_master
                    WHERE type='table' AND name='pending_actions';"""
             )
             if not cursor.fetchone():
                 return result  # Table doesn't exist yet, just return the main report
-                
+
             # Query pending actions
             cursor.execute(
                 """
-                SELECT file_path, current_label, size_human, proposed_action, 
+                SELECT file_path, current_label, size_human, proposed_action,
                        action_details, action_due_at
                 FROM pending_actions
                 WHERE status = 'pending'
@@ -124,7 +124,7 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
                 """
             )
             pending_actions = cursor.fetchall()
-            
+
             if pending_actions:
                 # Format pending actions table
                 pending_table = PrettyTable(field_names=["Path", "Current Label", "Size", "Source", "Resolution", "When"])
@@ -133,9 +133,9 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
                     pending_table.max_width["Path"] = 80
                 except Exception:  # noqa: BLE001
                     pass
-                
+
                 now = datetime.now()
-                
+
                 for path, current_label, size_human, proposed_action, action_details, action_due_at in pending_actions:
                     # Format the due date as a relative time
                     try:
@@ -146,7 +146,7 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
                         except ValueError:
                             # Fall back to standard format
                             due_date = datetime.strptime(action_due_at, "%Y-%m-%d %H:%M:%S")
-                            
+
                         days_until = (due_date - now).days
                         if days_until < 0:
                             when = "Overdue"
@@ -159,19 +159,19 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
                     except ValueError as e:
                         logger.warning(f"Failed to parse due date '{action_due_at}': {e}")
                         when = action_due_at  # Fallback if date parsing fails
-                    
+
                     # Determine the resolution based on action type
                     resolution = "Unknown"
                     if proposed_action == "RELABEL_OTHERCAT":
                         resolution = f"Label as {action_details}"
-                    
+
                     # Add row to pending table
                     pending_table.add_row([path, current_label or "", size_human, "torrents", resolution, when])
-                
+
                 # Add pending actions section to report
                 result += "\n\nPending Re-Labeling Actions:\n" + pending_table.get_string()
     except sqlite3.Error as exc:
         logger.error("SQLite error while formatting pending actions: {}", exc)
         # Continue with the main report even if there's an error with pending actions
-    
+
     return result

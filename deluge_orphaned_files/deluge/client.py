@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, Tuple, Set, TypedDict, Any, Protocol, TYPE_CHECKING
+from typing import Dict, Tuple, Set, Protocol, TYPE_CHECKING
 
 try:
     from deluge_client import DelugeRPCClient  # type: ignore
@@ -34,26 +34,28 @@ __all__ = ["get_deluge_files"]
 
 class DelugeConfig(Protocol):
     """Protocol defining the required configuration attributes for Deluge connection."""
+
     deluge_host: str
     deluge_port: int
     deluge_username: str
     deluge_password: str
     deluge_torrent_base_remote_folder: str
 
+
 def get_deluge_files(config: DelugeConfig) -> Tuple[Set[str], Dict[str, str], Dict[str, str]]:
     """Connect to Deluge and return information about torrent files.
-    
+
     Args:
         config: An object exposing the Deluge connection settings and
             deluge_torrent_base_remote_folder attribute (typically the global
             AppConfig instance).
-            
+
     Returns:
         A tuple containing:
             - Set of all file paths (relative to base folder)
             - Dictionary mapping file paths to their labels
             - Dictionary mapping file paths to their torrent IDs
-            
+
     Raises:
         RuntimeError: If the deluge-client package is not installed.
     """
@@ -67,16 +69,16 @@ def get_deluge_files(config: DelugeConfig) -> Tuple[Set[str], Dict[str, str], Di
         username=config.deluge_username,
         password=config.deluge_password,
     )
-    
+
     logger.debug("Connecting to Deluge: {}:{}", config.deluge_host, config.deluge_port)
-    
+
     all_files: set[str] = set()
     file_labels: Dict[str, str] = {}
     file_torrent_ids: Dict[str, str] = {}
-    
+
     try:
         client.connect()
-        
+
         logger.info(
             "Fetching torrent list from {}@{}:{}...",
             config.deluge_username,
@@ -110,7 +112,7 @@ def get_deluge_files(config: DelugeConfig) -> Tuple[Set[str], Dict[str, str], Di
                 all_files.add(relative_path)
                 file_labels[relative_path] = label
                 file_torrent_ids[relative_path] = torrent_id_str
-        
+
         logger.success("Found {} files in Deluge", len(all_files))
     finally:
         # Ensure client is disconnected properly

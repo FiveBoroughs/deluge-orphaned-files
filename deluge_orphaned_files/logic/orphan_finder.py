@@ -22,10 +22,10 @@ __all__: list[str] = ["compute_orphans"]
 
 def _size_human(num_bytes: int) -> str:
     """Convert byte size to human readable format.
-    
+
     Args:
         num_bytes: Size in bytes to convert.
-        
+
     Returns:
         String representation with unit (GB or MB) and 2 decimal places.
     """
@@ -36,23 +36,23 @@ def _size_human(num_bytes: int) -> str:
 
 def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool = False, no_progress: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Calculate orphaned files across torrent and media folders.
-    
+
     Compares files in the Deluge client, local torrent folders, and media folders
     to identify orphaned or mismatched files in three categories.
-    
+
     Args:
         config: The validated AppConfig instance with all required settings.
         skip_media_check: If True, only check torrent-folder orphans and skip
             the media folder scan completely.
         use_sqlite: Whether to use SQLite for hash caching instead of JSON files.
         no_progress: Whether to disable progress bars for file scanning.
-        
+
     Returns:
         A tuple containing three lists:
             1. Orphaned torrent files (in torrent folder but not in Deluge)
             2. Files only in torrents (in torrent folder but not in media folder)
             3. Files only in media (in media folder but not in torrent folder)
-            
+
         Each list contains dictionaries with file details (path, size, etc.).
     """
 

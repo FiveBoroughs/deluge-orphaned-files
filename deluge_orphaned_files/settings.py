@@ -14,7 +14,6 @@ Variables:
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -27,11 +26,11 @@ __all__ = ["AppConfig", "config"]
 
 class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarations
     """Application configuration loaded from environment variables (.env).
-    
+
     All settings are loaded from environment variables with validation.
     Required settings will cause validation errors if missing or invalid.
     Optional settings have sensible defaults.
-    
+
     Attributes:
         deluge_host: Hostname of the Deluge RPC server.
         deluge_port: Port number of the Deluge RPC server.
@@ -118,14 +117,14 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
     )
     def _validate_directory_path(cls, v: Any, info: ValidationInfo) -> Path:
         """Validate that the path exists, is a directory, and is readable.
-        
+
         Args:
             v: The path value to validate.
             info: Validation context information.
-            
+
         Returns:
             Path object if validation succeeds.
-            
+
         Raises:
             ValueError: If the path doesn't exist, isn't a directory, or isn't readable.
         """
