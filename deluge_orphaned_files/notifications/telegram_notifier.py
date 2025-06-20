@@ -78,7 +78,7 @@ def _send_in_chunks(*, bot_token: str, chat_id: str, title: str, content: str, c
 
             # Split long line into sub-chunks
             for i in range(0, len(line), chunk_size):
-                sub_chunk = line[i:i + chunk_size]
+                sub_chunk = line[i : i + chunk_size]  # noqa: E203
                 # Each sub-chunk becomes its own complete chunk
                 chunks.append(sub_chunk)
         # Normal case - line fits within chunk_size

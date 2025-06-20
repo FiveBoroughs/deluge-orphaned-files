@@ -139,13 +139,33 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
                 for path, current_label, size_human, proposed_action, action_details, action_due_at in pending_actions:
                     # Format the due date as a relative time
                     try:
-                        # Try to parse using multiple formats to handle both ISO and standard formats
-                        try:
-                            # Try ISO format first (with T separator)
-                            due_date = datetime.strptime(action_due_at, "%Y-%m-%dT%H:%M:%S")
-                        except ValueError:
-                            # Fall back to standard format
-                            due_date = datetime.strptime(action_due_at, "%Y-%m-%d %H:%M:%S")
+                        # Try to parse using multiple formats to handle different date formats
+                        due_date = None
+
+                        # Try different date formats
+                        date_formats = [
+                            "%Y-%m-%d %H:%M:%S",  # Standard format: 2025-06-20 22:20:21
+                            "%Y-%m-%dT%H:%M:%S",  # ISO without microseconds: 2025-06-20T13:35:57
+                            "%Y-%m-%dT%H:%M:%S.%f",  # ISO with microseconds: 2025-06-20T13:35:57.086643
+                            "%Y-%m-%dT%H:%M:%S.%f%z",  # ISO with timezone: 2025-06-20T13:35:57.086643+0000
+                        ]
+
+                        # Remove timezone info if present (simplest approach)
+                        clean_date_str = action_due_at
+                        if "+" in clean_date_str:
+                            clean_date_str = clean_date_str.split("+")[0]
+
+                        # Try each format until one works
+                        for date_format in date_formats:
+                            try:
+                                due_date = datetime.strptime(clean_date_str, date_format)
+                                break  # Exit the loop if parsing succeeds
+                            except ValueError:
+                                continue  # Try next format
+
+                        # If no format worked, raise ValueError
+                        if due_date is None:
+                            raise ValueError(f"No format matched for date string: {action_due_at}")
 
                         days_until = (due_date - now).days
                         if days_until < 0:

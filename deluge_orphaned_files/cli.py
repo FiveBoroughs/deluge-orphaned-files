@@ -23,7 +23,8 @@ from pydantic import (
     ValidationInfo,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from .scanning.hasher import get_file_hash
+
+from .scanning.hasher import get_file_hash_with_algorithm  # noqa: F401
 from .scanning.file_scanner import (
     should_process_file,
     get_local_files as _scan_get_local_files,
@@ -37,6 +38,12 @@ from .database.hash_cache import (
     upsert_hash_to_sqlite as db_upsert_hash_to_sqlite,
 )
 from .logic.orphan_finder import compute_orphans
+from .logic.pending_actions import (
+    init_pending_actions_schema,
+    register_pending_action,
+    execute_pending_actions as execute_all_pending_actions,
+    ActionType,
+)
 from .logic.retention import (
     get_files_to_mark_for_deletion as retention_get_files_to_mark,
     get_files_to_actually_delete as retention_get_files_to_delete,
@@ -315,36 +322,8 @@ def init_sqlite_cache(db_path: Path) -> None:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_fsh_scan_id ON file_scan_history (scan_id);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_fsh_file_id ON file_scan_history (file_id);")
 
-            logger.trace("Ensuring 'pending_actions' table exists.")
-            cursor.execute(
-                """
-            CREATE TABLE IF NOT EXISTS pending_actions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                orphaned_file_id INTEGER NOT NULL,
-                torrent_id TEXT,
-                file_path TEXT NOT NULL,
-                current_label TEXT,
-                proposed_action TEXT NOT NULL,  -- e.g., 'RELABEL_OTHERCAT'
-                action_details TEXT,            -- e.g., target label
-                size_human TEXT NOT NULL,
-                scan_id_identified INTEGER NOT NULL,
-                identified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                action_due_at TIMESTAMP NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'completed', 'cancelled', 'failed'
-                scan_id_processed INTEGER,
-                processed_at TIMESTAMP,
-                processing_notes TEXT,
-                FOREIGN KEY (orphaned_file_id) REFERENCES orphaned_files(id),
-                FOREIGN KEY (scan_id_identified) REFERENCES scan_results(id),
-                FOREIGN KEY (scan_id_processed) REFERENCES scan_results(id)
-            );
-            """
-            )
-
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_status ON pending_actions (status);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_action_due_at ON pending_actions (action_due_at);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_orphaned_file_id ON pending_actions (orphaned_file_id);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_scan_id_identified ON pending_actions (scan_id_identified);")
+            # Initialize pending actions schema using the dedicated module
+            init_pending_actions_schema(db_path)
 
             logger.trace("Ensuring 'vw_latest_scan_report' view exists.")
             cursor.execute(
@@ -702,21 +681,31 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
             if cache_key in hash_cache:
                 cached_data = hash_cache[cache_key]
                 cached_mtime = float(cached_data["mtime"])
+                hash_algorithm = cached_data.get("hash_algorithm", "md5")  # Default to md5 for older cache entries
+
                 if abs(cached_mtime - mtime) <= 2:
                     file_hash = cached_data["hash"]
-                    cache_hit = True
-                    logger.trace(f"Cache hit for {relative_path}: hash {file_hash}")
+
+                    # If we have a hash but it's using the old algorithm (md5), we need to rehash with xxhash64
+                    # This allows for gradual migration of the cache
+                    if hash_algorithm == "md5":
+                        logger.info(f"Upgrading hash for {relative_path} from MD5 to XXHash64")
+                        # Mark as cache miss to force rehashing with the new algorithm
+                        cache_hit = False
+                    else:
+                        cache_hit = True
+                        logger.trace(f"Cache hit for {relative_path}: hash {file_hash} using {hash_algorithm}")
                 else:
                     logger.debug(f"Cache mtime mismatch for {relative_path}: cached {cached_mtime}, current {mtime}")
 
             if not cache_hit:
                 logger.info(f"Cache miss for {relative_path}. Calculating hash.")
                 try:
-                    file_hash = get_file_hash(Path(full_path_str), no_progress=no_progress)
+                    file_hash, hash_algorithm = get_file_hash_with_algorithm(Path(full_path_str), "xxh64", no_progress=no_progress)
                     if file_hash:
                         new_hashes_calculated_count += 1
-                        hash_cache[cache_key] = {"hash": file_hash, "mtime": mtime}
-                        logger.debug(f"Updated in-memory cache for {relative_path} with new hash {file_hash}")
+                        hash_cache[cache_key] = {"hash": file_hash, "mtime": mtime, "hash_algorithm": hash_algorithm}
+                        logger.debug(f"Updated in-memory cache for {relative_path} with new {hash_algorithm} hash {file_hash}")
                         if use_sqlite:
                             sqlite_updates_batch.append(
                                 (
@@ -725,6 +714,7 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
                                     relative_path,
                                     mtime,
                                     file_size,
+                                    "xxh64",  # Always use xxh64 for new/updated hashes
                                 )
                             )
                         else:
@@ -743,7 +733,8 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
                 pbar.update(1)
                 continue
 
-            local_files[relative_path] = {"hash": file_hash, "size": file_size}
+            # Get the hash algorithm from the cache if it exists, otherwise default to xxh64 for new hashes            hash_algorithm = hash_cache.get(cache_key, {}).get("hash_algorithm", "xxh64")
+            local_files[relative_path] = {"hash": file_hash, "size": file_size, "hash_algorithm": hash_algorithm}
 
             if not use_sqlite and files_since_last_json_save >= config.cache_save_interval:
                 if cache_file:
@@ -1452,7 +1443,7 @@ def migrate_json_to_sqlite(no_progress: bool = False):
     logger.info("Starting migration of JSON hash caches to SQLite database...")
 
     # Initialize the SQLite database
-    init_sqlite_cache(str(config.sqlite_cache_path))
+    db_init_sqlite_cache(str(config.sqlite_cache_path))  # Use db version for schema migration
 
     folders_to_migrate = [
         (config.local_torrent_base_local_folder, "torrent folder"),
@@ -1845,7 +1836,6 @@ def process_autoremove_labeling(
     # Calculate the due date for the actions with a safe fallback value
     relabel_delay = getattr(config, "relabel_action_delay_days", 7)  # Default 7 days if not set
     action_due_at = datetime.now(timezone.utc) + timedelta(days=relabel_delay)
-    action_due_at_str = action_due_at.isoformat()
 
     logger.info(f"Found {len(files_to_process)} torrents to potentially label with '{target_label_prefix}'.")
 
@@ -1858,7 +1848,6 @@ def process_autoremove_labeling(
         torrent_id = item.get("torrent_id")
         current_label = item.get("label", "")
         file_path = item.get("path", "Unknown path")
-        size_human = item.get("size_human", "Unknown size")
 
         if not torrent_id:
             logger.warning(f"Item for path '{file_path}' missing 'torrent_id', skipping labeling.")
@@ -1878,38 +1867,29 @@ def process_autoremove_labeling(
             logger.debug(f"Torrent ID {torrent_id} (file: {file_path}) already has label '{current_label}' starting with '{target_label_prefix}'. Skipping.")
             continue
 
-        # The proposed action is always to relabel the torrent with the target prefix
-        proposed_action = "RELABEL_OTHERCAT"
-
         if apply_labels:
             try:
-                with sqlite3.connect(str(db_path)) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        INSERT INTO pending_actions
-                        (orphaned_file_id, torrent_id, file_path, current_label, proposed_action,
-                          action_details, size_human, scan_id_identified, identified_at, action_due_at, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, 'pending')
-                        """,
-                        (
-                            orphaned_file_id,
-                            torrent_id,
-                            file_path,
-                            current_label,
-                            proposed_action,
-                            target_label_prefix,  # action_details contains the target label
-                            size_human,
-                            latest_scan_id,
-                            action_due_at_str,
-                        ),
-                    )
-                    conn.commit()
-                    logger.info(
-                        f"Recorded pending action to apply label '{target_label_prefix}' to torrent ID {torrent_id} (file: {file_path}) on"
-                        f" {action_due_at.strftime('%Y-%m-%d')}. Previous label: '{current_label}'."
-                    )
-                    actions_recorded_count += 1
+                # Prepare action params as JSON
+                action_params = json.dumps({"torrent_id": torrent_id, "label": target_label_prefix, "current_label": current_label})
+
+                # Register the pending action using the dedicated module
+                register_pending_action(
+                    db_path=db_path,
+                    file_path=file_path,
+                    action_type=ActionType.RELABEL,
+                    waiting_period_days=config.relabel_action_delay_days,
+                    action_params=action_params,
+                    scan_id=str(latest_scan_id),
+                    orphaned_file_id=orphaned_file_id,
+                    torrent_hash=torrent_id,
+                    file_size=None,  # We don't have the size in bytes, only human-readable
+                    source="torrents",
+                )
+                logger.info(
+                    f"Recorded pending action to apply label '{target_label_prefix}' to torrent ID {torrent_id} (file: {file_path}) on"
+                    f" {action_due_at.strftime('%Y-%m-%d')}. Previous label: '{current_label}'."
+                )
+                actions_recorded_count += 1
             except sqlite3.Error as e:
                 logger.error(f"SQLite error recording pending action for torrent ID {torrent_id} (file: {file_path}): {e}")
         else:
@@ -1937,156 +1917,80 @@ def execute_pending_actions(
     """
     Process pending actions that are due for execution.
 
-    Checks the pending_actions table for actions where action_due_at has passed
-    and executes them based on their proposed_action type. Currently supports
-    RELABEL_OTHERCAT action type for applying labels to torrents.
+    This is a wrapper around the execute_pending_actions function in the pending_actions module.
+    It provides callbacks for the specific actions needed in this application context.
 
     Args:
         db_path (Path): Path to the SQLite database.
         client (DelugeRPCClient): An active Deluge RPC client instance.
         dry_run (bool): If True, only simulate the execution without actually making changes.
     """
-    # Get latest scan ID for recording as the processing scan
-    latest_scan_id = None
-    try:
-        with sqlite3.connect(str(db_path)) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM scan_results ORDER BY created_at DESC LIMIT 1;")
-            row = cursor.fetchone()
-            if row:
-                latest_scan_id = row[0]
-            else:
-                logger.error("No scan results found in database. Cannot process pending actions.")
-                return
-    except sqlite3.Error as e:
-        logger.error(f"SQLite error fetching latest scan ID: {e}")
-        return
 
-    # Get all due pending actions
-    pending_actions = []
-    try:
-        with sqlite3.connect(str(db_path)) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT id, orphaned_file_id, torrent_id, file_path, current_label,
-                        proposed_action, action_details, size_human, identified_at, action_due_at
-                FROM pending_actions
-                WHERE status = 'pending' AND action_due_at <= datetime('now');
-                """
-            )
-            for row in cursor.fetchall():
-                pending_actions.append(
-                    {
-                        "id": row[0],
-                        "orphaned_file_id": row[1],
-                        "torrent_id": row[2],
-                        "file_path": row[3],
-                        "current_label": row[4] or "",
-                        "proposed_action": row[5],
-                        "action_details": row[6],
-                        "size_human": row[7],
-                        "identified_at": row[8],
-                        "action_due_at": row[9],
-                    }
-                )
-    except sqlite3.Error as e:
-        logger.error(f"SQLite error fetching pending actions: {e}")
-        return
+    # Define callbacks for actions
+    def apply_relabel_callback(file_path: str, action_params: str) -> bool:
+        """
+        Apply a label to a torrent.
 
-    if not pending_actions:
-        logger.info("No pending actions are currently due for processing.")
-        return
+        Args:
+            file_path: Path to the file (used for logging)
+            action_params: JSON string containing action parameters
+                           Expected format: {"torrent_id": "...", "label": "..."}
 
-    logger.info(f"Found {len(pending_actions)} pending actions that are due for processing.")
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            params = json.loads(action_params) if action_params else {}
+            torrent_id = params.get("torrent_id")
+            new_label = params.get("label")
 
-    # Process each pending action
-    for action in pending_actions:
-        action_id = action["id"]
-        torrent_id = action["torrent_id"]
-        file_path = action["file_path"]
-        current_label = action["current_label"]
-        proposed_action = action["proposed_action"]
-        action_details = action["action_details"]
-        # size_human available but not used in current implementation
-
-        if proposed_action == "RELABEL_OTHERCAT":
-            new_label = action_details
+            if not torrent_id or not new_label:
+                logger.error(f"Missing required parameters (torrent_id or label) for relabeling: {action_params}")
+                return False
 
             # Check if the torrent still exists in Deluge
             try:
-                torrent_exists = False
-                try:
-                    # Try to get the torrent status to check if it exists
-                    status = client.core.get_torrent_status(torrent_id, ["name"])
-                    torrent_exists = bool(status)  # Will be empty dict if torrent doesn't exist
-                except Exception as e:
-                    logger.warning(f"Error checking if torrent ID {torrent_id} exists: {e}")
-                    torrent_exists = False
-
-                if not torrent_exists:
-                    if not dry_run:
-                        with sqlite3.connect(str(db_path)) as conn:
-                            cursor = conn.cursor()
-                            cursor.execute(
-                                """
-                                UPDATE pending_actions
-                                SET status = 'failed', scan_id_processed = ?, processed_at = datetime('now'),
-                                    processing_notes = 'Torrent no longer exists in Deluge'
-                                WHERE id = ?;
-                                """,
-                                (latest_scan_id, action_id),
-                            )
-                            conn.commit()
-                    logger.warning(f"Cannot apply label '{new_label}' to torrent ID {torrent_id} (file: {file_path}) as it no longer exists in Deluge.")
-                    continue
-
-                # Apply the label if not dry run
-                if not dry_run:
-                    try:
-                        client.label.set_torrent(torrent_id, new_label)
-
-                        # Update the pending action as completed
-                        with sqlite3.connect(str(db_path)) as conn:
-                            cursor = conn.cursor()
-                            cursor.execute(
-                                """
-                                UPDATE pending_actions
-                                SET status = 'completed', scan_id_processed = ?, processed_at = datetime('now'),
-                                    processing_notes = ?
-                                WHERE id = ?;
-                                """,
-                                (latest_scan_id, f"Applied label '{new_label}'. Previous label: '{current_label}'", action_id),
-                            )
-                            conn.commit()
-                        logger.info(f"Applied label '{new_label}' to torrent ID {torrent_id} (file: {file_path}). Previous label: '{current_label}'.")
-                    except Exception as e:
-                        # Update the pending action as failed
-                        with sqlite3.connect(str(db_path)) as conn:
-                            cursor = conn.cursor()
-                            cursor.execute(
-                                """
-                                UPDATE pending_actions
-                                SET status = 'failed', scan_id_processed = ?, processed_at = datetime('now'),
-                                    processing_notes = ?
-                                WHERE id = ?;
-                                """,
-                                (latest_scan_id, f"Error applying label: {str(e)}", action_id),
-                            )
-                            conn.commit()
-                        logger.error(f"Error applying label '{new_label}' to torrent ID {torrent_id} (file: {file_path}): {e}")
-                else:
-                    logger.info(f"[DRY RUN] Would apply label '{new_label}' to torrent ID {torrent_id} (file: {file_path}). Previous label: '{current_label}'.")
+                status = client.core.get_torrent_status(torrent_id, ["name"])
+                if not status:  # Empty dict if torrent doesn't exist
+                    logger.warning(f"Cannot apply label '{new_label}' to torrent ID {torrent_id} as it no longer exists in Deluge.")
+                    return False
             except Exception as e:
-                logger.error(f"Unexpected error processing pending action ID {action_id} for torrent ID {torrent_id}: {e}")
-        else:
-            logger.warning(f"Unsupported action type '{proposed_action}' for pending action ID {action_id}. Skipping.")
+                logger.warning(f"Error checking if torrent ID {torrent_id} exists: {e}")
+                return False
 
-    # Log summary of processed actions
-    if dry_run:
-        logger.info(f"[DRY RUN] Would have processed {len(pending_actions)} pending actions.")
-    else:
-        logger.info(f"Successfully processed {len(pending_actions)} pending actions.")
+            # Apply the label
+            client.label.set_torrent(torrent_id, new_label)
+            logger.info(f"Applied label '{new_label}' to torrent ID {torrent_id} (file: {file_path})")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error applying label to torrent (file: {file_path}): {e}")
+            return False
+
+    def delete_file_callback(file_path: str) -> bool:
+        """
+        Delete a file from the filesystem.
+
+        Args:
+            file_path: Path to the file to delete
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"Deleted file: {file_path}")
+                return True
+            else:
+                logger.warning(f"File does not exist, cannot delete: {file_path}")
+                return False
+        except Exception as e:
+            logger.error(f"Error deleting file {file_path}: {e}")
+            return False
+
+    # Execute all pending actions using the dedicated module
+    execute_all_pending_actions(db_path=db_path, apply_relabel_callback=apply_relabel_callback, delete_file_callback=delete_file_callback, dry_run=dry_run)
 
 
 def main() -> None:
@@ -2221,11 +2125,9 @@ def main() -> None:
 
     if args.sqlite:
         logger.debug(f"Initializing SQLite database schema at {config.sqlite_cache_path}")
-        init_sqlite_cache(str(config.sqlite_cache_path))
+        db_init_sqlite_cache(str(config.sqlite_cache_path))  # Use db version for schema migration
 
-    # -----------------------------------------------------------------------
-    # Test e-mail shortcut
-    # -----------------------------------------------------------------------
+    # Email test
     if args.test_email:
         if config.smtp_host and config.smtp_username and config.smtp_password and config.smtp_from_addr and config.smtp_to_addrs:
             test_body = (

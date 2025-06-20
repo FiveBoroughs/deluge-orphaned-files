@@ -127,7 +127,9 @@ def save_hash_cache(cache_file: Path, hash_cache: dict[str, dict[str, object]]) 
         logger.error("Error saving cache {}: {}", cache_file, exc)
 
 
-def _upsert_hash_to_sqlite(conn: sqlite3.Connection, folder_path: Path, relative_path: str, file_hash: str, mtime: float, file_size: int) -> None:  # noqa: D401 – internal util
+def _upsert_hash_to_sqlite(
+    conn: sqlite3.Connection, folder_path: Path, relative_path: str, file_hash: str, mtime: float, file_size: int, hash_algorithm: str = "xxh64"
+) -> None:  # noqa: D401 – internal util
     """Insert or replace a row in the file_hashes table.
 
     Args:
@@ -142,10 +144,10 @@ def _upsert_hash_to_sqlite(conn: sqlite3.Connection, folder_path: Path, relative
     conn.execute(
         """
         INSERT OR REPLACE INTO file_hashes
-        (file_hash, folder_path, relative_path, mtime, file_size)
-        VALUES (?, ?, ?, ?, ?)
+        (file_hash, folder_path, relative_path, mtime, file_size, hash_algorithm)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (file_hash, str(folder_path), relative_path, mtime, file_size),
+        (file_hash, str(folder_path), relative_path, mtime, file_size, hash_algorithm),
     )
 
 
@@ -223,17 +225,18 @@ def get_local_files(
 
             if cache_hit:
                 file_hash = cached["hash"]
+                hash_algorithm = cached.get("hash_algorithm", "md5")  # Default to md5 for older cache entries
             else:
-                file_hash = get_file_hash(Path(full_path_str), no_progress=no_progress)
+                file_hash, hash_algorithm = get_file_hash(Path(full_path_str), no_progress=no_progress)
                 new_hashes += 1
 
                 # Update in-memory cache
-                hash_cache[rel_path] = {"hash": file_hash, "mtime": mtime}
+                hash_cache[rel_path] = {"hash": file_hash, "mtime": mtime, "hash_algorithm": hash_algorithm}
 
                 if use_sqlite:
-                    sqlite_batch.append((file_hash, str(folder), rel_path, mtime, st.st_size))
+                    sqlite_batch.append((file_hash, str(folder), rel_path, mtime, st.st_size, hash_algorithm))
 
-            local_files[rel_path] = {"hash": file_hash, "size": st.st_size}
+            local_files[rel_path] = {"hash": file_hash, "size": st.st_size, "hash_algorithm": hash_algorithm}
 
             bar.update(1)
 
@@ -242,11 +245,12 @@ def get_local_files(
         try:
             with sqlite3.connect(str(config.sqlite_cache_path)) as conn:  # type: ignore[attr-defined]
                 conn.executemany(
-                    "INSERT OR REPLACE INTO file_hashes (file_hash, folder_path, relative_path, mtime, file_size) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO file_hashes (file_hash, folder_path, relative_path, mtime, file_size, hash_algorithm) VALUES (?, ?, ?, ?, ?, ?)",
                     sqlite_batch,
                 )
         except sqlite3.Error as exc:
-            logger.error("SQLite batch upsert error for {}: {}", folder, exc)
+            logger.critical("SQLite batch upsert FAILED for {}: {}", folder, exc)
+            raise
     elif not use_sqlite:
         cache_file = folder / ".hash_cache.json"
         save_hash_cache(cache_file, hash_cache)
