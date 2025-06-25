@@ -250,7 +250,16 @@ def load_hashes_from_sqlite(db_path: str | Path, folder_path: Path) -> Dict[str,
                 for row in cursor.fetchall():
                     relative_path, file_hash, mtime, file_size, hash_algorithm = row
                     # Ensure hash length matches algorithm expectations
-                    validate_hash(file_hash, hash_algorithm or "md5")
+                    try:
+                        validate_hash(file_hash, hash_algorithm or "md5")
+                    except ValueError as ve:
+                        logger.error(
+                            "Invalid hash record for %s/%s in cache: %s. Skipping row.",
+                            folder_path,
+                            relative_path,
+                            ve,
+                        )
+                        continue
 
                     cache[relative_path] = {
                         "hash": file_hash,

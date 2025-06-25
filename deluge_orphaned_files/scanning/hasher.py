@@ -40,7 +40,7 @@ def validate_hash(hash_value: str, algorithm: str) -> None:
         raise ValueError(f"Hash length mismatch: got {len(hash_value)} chars, expected {expected} for {algorithm}")
 
 
-__all__ = ["get_file_hash", "get_file_hash_with_algorithm"]
+__all__ = ["get_file_hash", "get_file_hash_with_algorithm", "infer_algorithm_from_hash"]
 
 
 def get_file_hash_with_algorithm(file_path: Path, algorithm: Literal["md5", "xxh64"] = "xxh64", no_progress: bool = False) -> Tuple[str, str]:
@@ -95,6 +95,30 @@ def get_file_hash_with_algorithm(file_path: Path, algorithm: Literal["md5", "xxh
     # Sanity-check length
     validate_hash(digest, algorithm)
     return digest, algorithm
+
+
+def infer_algorithm_from_hash(hash_value: str) -> Literal["md5", "xxh64"]:
+    """Infer the hashing algorithm based solely on *hash_value* length.
+
+    Args:
+        hash_value: Hexadecimal digest string.
+
+    Returns:
+        "xxh64" if the digest length matches the 16-char XXHash64 format, otherwise "md5" for 32-char MD5.
+
+    Raises:
+        ValueError: If *hash_value* length doesn't correspond to a supported algorithm.
+    """
+
+    length = len(hash_value)
+    if length == _HASH_LENGTHS["xxh64"]:
+        return "xxh64"
+    if length == _HASH_LENGTHS["md5"]:
+        return "md5"
+
+    raise ValueError(
+        f"Unable to infer hash algorithm from digest of length {length}. Supported lengths: {_HASH_LENGTHS}."
+    )
 
 
 def get_file_hash(file_path: Path, no_progress: bool = False) -> tuple[str, str]:

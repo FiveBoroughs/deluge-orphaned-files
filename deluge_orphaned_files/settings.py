@@ -142,7 +142,13 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
         path_obj = Path(v)
         parent_dir = path_obj.parent
         if not parent_dir.exists():
-            raise ValueError(f"Parent directory for {info.field_name} does not exist: {parent_dir}")
+            try:
+                parent_dir.mkdir(parents=True, exist_ok=True)
+                logger.debug("Created output_file parent directory: %s", parent_dir)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    f"Parent directory for {info.field_name} did not exist and could not be created: {parent_dir}. Error: {exc}"
+                ) from exc
         if not parent_dir.is_dir():
             raise ValueError(f"Parent path for {info.field_name} is not a directory: {parent_dir}")
         if not os.access(parent_dir, os.W_OK):
@@ -151,10 +157,17 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
 
     @field_validator("sqlite_cache_path", mode="before")
     def _validate_sqlite_cache_path(cls, v: Any, info: ValidationInfo) -> Path:
+        """Ensure the SQLite cache directory exists (create if necessary)."""
         path_obj = Path(v)
         parent_dir = path_obj.parent
         if not parent_dir.exists():
-            raise ValueError(f"Parent directory for {info.field_name} does not exist: {parent_dir}")
+            try:
+                parent_dir.mkdir(parents=True, exist_ok=True)
+                logger.debug("Created SQLite parent directory: %s", parent_dir)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    f"Parent directory for {info.field_name} did not exist and could not be created: {parent_dir}. Error: {exc}"
+                ) from exc
         if not parent_dir.is_dir():
             raise ValueError(f"Parent path for {info.field_name} is not a directory: {parent_dir}")
         if not os.access(parent_dir, os.W_OK):

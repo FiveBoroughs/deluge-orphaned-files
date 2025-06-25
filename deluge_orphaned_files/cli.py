@@ -24,7 +24,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .scanning.hasher import get_file_hash_with_algorithm  # noqa: F401
+from .scanning.hasher import get_file_hash_with_algorithm, infer_algorithm_from_hash  # noqa: F401
 from .scanning.file_scanner import (
     should_process_file,
     get_local_files as _scan_get_local_files,
@@ -56,20 +56,41 @@ from .notifications.emailer import send_scan_report
 from .notifications.telegram_notifier import send_scan_report as send_telegram_report
 from . import __version__
 
-# Configure Loguru
-log_file_path = Path(__file__).parent / "deluge_orphaned_files.log"
-logger.remove()  # Remove default stderr logger
+# ---------------------------------------------------------------------------
+# Configure Loguru – log to console and to config/logs/deluge_orphaned_files.log
+# ---------------------------------------------------------------------------
+
+# Allow override via environment variable; fallback to ./config/logs inside the
+# project (works both in Docker and local checkout)
+log_dir_env = os.getenv("APP_LOG_DIR")
+if log_dir_env:
+    log_dir = Path(log_dir_env)
+else:
+    # project_root = Path(__file__).resolve().parents[1]
+    log_dir = Path(__file__).resolve().parents[1] / "config" / "logs"
+
+# Ensure directory exists
+log_dir.mkdir(parents=True, exist_ok=True)
+
+log_file_path = log_dir / "deluge_orphaned_files.log"
+
+logger.remove()  # Remove default stderr logger (Loguru default)
 logger.add(
     sys.stdout,
     level="INFO",
-    format=("<green>{time:YYYY-MM-DD HH:mm:ss}</green> | " "<level>{level: <8}</level> | " "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - " "<level>{message}</level>"),
+    format=(
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+        "<level>{message}</level>"
+    ),
 )
 logger.add(
     log_file_path,
     rotation="1 day",
     retention="30 days",
     level="DEBUG",
-    format=("{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | " "{name}:{function}:{line} - {message}"),
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
 )
 
 logger.info("Logging initialized. Log file: {}", log_file_path)
@@ -681,7 +702,7 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
             if cache_key in hash_cache:
                 cached_data = hash_cache[cache_key]
                 cached_mtime = float(cached_data["mtime"])
-                hash_algorithm = cached_data.get("hash_algorithm", "md5")  # Default to md5 for older cache entries
+                hash_algorithm = cached_data.get("hash_algorithm") or infer_algorithm_from_hash(cached_data["hash"])
 
                 if abs(cached_mtime - mtime) <= 2:
                     file_hash = cached_data["hash"]
@@ -733,7 +754,14 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
                 pbar.update(1)
                 continue
 
-            # Get the hash algorithm from the cache if it exists, otherwise default to xxh64 for new hashes            hash_algorithm = hash_cache.get(cache_key, {}).get("hash_algorithm", "xxh64")
+            # Get the hash algorithm from the cache if it exists, otherwise default to xxh64 for new hashes            cached_entry = hash_cache.get(cache_key, {})
+            if "hash_algorithm" in cached_entry:
+                hash_algorithm = cached_entry["hash_algorithm"]
+            else:
+                try:
+                    hash_algorithm = infer_algorithm_from_hash(cached_entry.get("hash", ""))
+                except ValueError:
+                    hash_algorithm = "xxh64"
             local_files[relative_path] = {"hash": file_hash, "size": file_size, "hash_algorithm": hash_algorithm}
 
             if not use_sqlite and files_since_last_json_save >= config.cache_save_interval:
@@ -2307,8 +2335,6 @@ def main() -> None:
             logger.info("\n{}", summary_table)
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to generate console summary table: {}", exc)
-
-    logger.debug("Telegram configuration incomplete or notification disabled; skipping notification.")
 
 
 if __name__ == "__main__":

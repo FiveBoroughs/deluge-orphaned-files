@@ -22,7 +22,7 @@ import sqlite3
 from loguru import logger
 from tqdm import tqdm
 from ..database.hash_cache import load_hashes_from_sqlite  # import centralised helper
-from .hasher import get_file_hash
+from .hasher import get_file_hash, infer_algorithm_from_hash
 
 
 class AppConfigLike(Protocol):  # pragma: no cover – simple structural helper
@@ -225,7 +225,7 @@ def get_local_files(
 
             if cache_hit:
                 file_hash = cached["hash"]
-                hash_algorithm = cached.get("hash_algorithm", "md5")  # Default to md5 for older cache entries
+                hash_algorithm = cached.get("hash_algorithm") or infer_algorithm_from_hash(cached["hash"])
             else:
                 file_hash, hash_algorithm = get_file_hash(Path(full_path_str), no_progress=no_progress)
                 new_hashes += 1
