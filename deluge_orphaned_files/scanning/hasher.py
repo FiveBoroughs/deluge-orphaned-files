@@ -116,9 +116,7 @@ def infer_algorithm_from_hash(hash_value: str) -> Literal["md5", "xxh64"]:
     if length == _HASH_LENGTHS["md5"]:
         return "md5"
 
-    raise ValueError(
-        f"Unable to infer hash algorithm from digest of length {length}. Supported lengths: {_HASH_LENGTHS}."
-    )
+    raise ValueError(f"Unable to infer hash algorithm from digest of length {length}. Supported lengths: {_HASH_LENGTHS}.")
 
 
 def get_file_hash(file_path: Path, no_progress: bool = False) -> tuple[str, str]:

@@ -146,9 +146,7 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
                 parent_dir.mkdir(parents=True, exist_ok=True)
                 logger.debug("Created output_file parent directory: %s", parent_dir)
             except Exception as exc:  # noqa: BLE001
-                raise ValueError(
-                    f"Parent directory for {info.field_name} did not exist and could not be created: {parent_dir}. Error: {exc}"
-                ) from exc
+                raise ValueError(f"Parent directory for {info.field_name} did not exist and could not be created: {parent_dir}. Error: {exc}") from exc
         if not parent_dir.is_dir():
             raise ValueError(f"Parent path for {info.field_name} is not a directory: {parent_dir}")
         if not os.access(parent_dir, os.W_OK):
@@ -165,9 +163,7 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
                 parent_dir.mkdir(parents=True, exist_ok=True)
                 logger.debug("Created SQLite parent directory: %s", parent_dir)
             except Exception as exc:  # noqa: BLE001
-                raise ValueError(
-                    f"Parent directory for {info.field_name} did not exist and could not be created: {parent_dir}. Error: {exc}"
-                ) from exc
+                raise ValueError(f"Parent directory for {info.field_name} did not exist and could not be created: {parent_dir}. Error: {exc}") from exc
         if not parent_dir.is_dir():
             raise ValueError(f"Parent path for {info.field_name} is not a directory: {parent_dir}")
         if not os.access(parent_dir, os.W_OK):

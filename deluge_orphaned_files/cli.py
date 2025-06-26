@@ -78,12 +78,7 @@ logger.remove()  # Remove default stderr logger (Loguru default)
 logger.add(
     sys.stdout,
     level="INFO",
-    format=(
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-        "<level>{message}</level>"
-    ),
+    format=("<green>{time:YYYY-MM-DD HH:mm:ss}</green> | " "<level>{level: <8}</level> | " "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - " "<level>{message}</level>"),
 )
 logger.add(
     log_file_path,
@@ -754,13 +749,15 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
                 pbar.update(1)
                 continue
 
-            # Get the hash algorithm from the cache if it exists, otherwise default to xxh64 for new hashes            cached_entry = hash_cache.get(cache_key, {})
+            # Get the hash algorithm from the cache if it exists, otherwise default to xxh64 for new hashes
+            cached_entry = hash_cache.get(cache_key, {})
             if "hash_algorithm" in cached_entry:
                 hash_algorithm = cached_entry["hash_algorithm"]
             else:
                 try:
                     hash_algorithm = infer_algorithm_from_hash(cached_entry.get("hash", ""))
                 except ValueError:
+                    # Fallback to xxh64 if the hash format can't be inferred (e.g., empty string)
                     hash_algorithm = "xxh64"
             local_files[relative_path] = {"hash": file_hash, "size": file_size, "hash_algorithm": hash_algorithm}
 
