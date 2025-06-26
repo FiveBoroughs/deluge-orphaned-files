@@ -33,10 +33,11 @@ jobs:
       - name: Flake8 linting (line length 200)
         run: flake8 --max-line-length 200 .
 
-      - name: Run unit tests (skipped if none present)
+      - name: Run unit tests (skip failure when none collected)
         run: |
           if [ -d "tests" ]; then
-            pytest -q
+            # Run pytest; exit code 5 means "no tests collected" and should not fail the job
+            pytest -q || [ $? -eq 5 ]
           else
             echo "No test suite detected; skipping pytest."
           fi
