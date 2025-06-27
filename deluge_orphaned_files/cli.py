@@ -1909,6 +1909,7 @@ def process_autoremove_labeling(
                     torrent_hash=torrent_id,
                     file_size=None,  # We don't have the size in bytes, only human-readable
                     source="torrents",
+                    size_human=item.get("size_human"),
                 )
                 logger.info(
                     f"Recorded pending action to apply label '{target_label_prefix}' to torrent ID {torrent_id} (file: {file_path}) on"
@@ -1952,7 +1953,7 @@ def execute_pending_actions(
     """
 
     # Define callbacks for actions
-    def apply_relabel_callback(file_path: str, action_params: str) -> bool:
+    def apply_relabel_callback(file_path: str, action_params: str) -> tuple[bool, str | None]:
         """
         Apply a label to a torrent.
 
@@ -1971,14 +1972,14 @@ def execute_pending_actions(
 
             if not torrent_id or not new_label:
                 logger.error(f"Missing required parameters (torrent_id or label) for relabeling: {action_params}")
-                return False
+                return (False, "missing_params")
 
             # Check if the torrent still exists in Deluge
             try:
                 status = client.core.get_torrent_status(torrent_id, ["name"])
                 if not status:  # Empty dict if torrent doesn't exist
                     logger.warning(f"Cannot apply label '{new_label}' to torrent ID {torrent_id} as it no longer exists in Deluge.")
-                    return False
+                    return (False, "not_found")
             except Exception as e:
                 logger.warning(f"Error checking if torrent ID {torrent_id} exists: {e}")
                 return False
@@ -1986,11 +1987,11 @@ def execute_pending_actions(
             # Apply the label
             client.label.set_torrent(torrent_id, new_label)
             logger.info(f"Applied label '{new_label}' to torrent ID {torrent_id} (file: {file_path})")
-            return True
+            return (True, None)
 
         except Exception as e:
             logger.error(f"Error applying label to torrent (file: {file_path}): {e}")
-            return False
+            return (False, "error")
 
     def delete_file_callback(file_path: str) -> bool:
         """

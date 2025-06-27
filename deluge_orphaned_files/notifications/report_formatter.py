@@ -136,7 +136,14 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
 
                 now = datetime.now()
 
+                # Track paths that have already been added to avoid duplicate rows in the report
+                seen_paths: set[str] = set()
+
                 for path, current_label, size_human, proposed_action, action_details, action_due_at in pending_actions:
+                    # Skip duplicate entries by absolute path
+                    if path in seen_paths:
+                        continue
+                    seen_paths.add(path)
                     # Format the due date as a relative time
                     try:
                         # Try to parse using multiple formats to handle different date formats
@@ -182,8 +189,13 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
 
                     # Determine the resolution based on action type
                     resolution = "Unknown"
-                    if proposed_action == "RELABEL_OTHERCAT":
-                        resolution = f"Label as {action_details}"
+                    # Determine human-friendly description of the proposed action
+                    pa_lower = (proposed_action or "").lower()
+                    if pa_lower.startswith("relabel"):
+                        label_name = action_details or "othercat"
+                        resolution = f"Label as {label_name}"
+                    elif pa_lower.startswith("delete"):
+                        resolution = "Deletion"
 
                     # Add row to pending table
                     pending_table.add_row([path, current_label or "", size_human, "torrents", resolution, when])

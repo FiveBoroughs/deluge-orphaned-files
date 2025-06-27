@@ -40,6 +40,7 @@ class ActionType(Enum):
     DELETE = auto()  # Delete file
     RELABEL = auto()  # Apply othercat label
     MANUAL_REVIEW = auto()  # Require manual review
+    UNKNOWN = auto()  # Unknown / unsupported action type
 
 
 def init_pending_actions_schema(db_path: str | Path) -> None:
@@ -198,6 +199,47 @@ def register_pending_action(
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
 
+            # -------------------------------------------------------------
+            # Prevent duplicate pending actions for the same file & action.
+            # If one already exists in 'pending' state, update any missing
+            # information (size_human / current_label) instead of inserting
+            # a new record. This eliminates the DB bloat the user observed.
+            # -------------------------------------------------------------
+            cursor.execute(
+                """
+                SELECT id, size_human, current_label
+                FROM pending_actions
+                WHERE file_path = ? AND proposed_action = ? AND status = 'pending'
+                LIMIT 1
+                """,
+                (file_path, proposed_action),
+            )
+            existing_row = cursor.fetchone()
+            if existing_row:
+                existing_id, existing_size_human, existing_current_label = existing_row
+                update_fields: list[str] = []
+                params: list[Any] = []
+
+                # Patch size_human if we now have a better value
+                if size_human not in (None, "", "Unknown") and existing_size_human in (None, "", "Unknown"):
+                    update_fields.append("size_human = ?")
+                    params.append(size_human)
+
+                # Patch current_label if known / changed
+                if current_label and current_label != existing_current_label:
+                    update_fields.append("current_label = ?")
+                    params.append(current_label)
+
+                if update_fields:
+                    params.append(existing_id)
+                    cursor.execute(
+                        f"UPDATE pending_actions SET {', '.join(update_fields)} WHERE id = ?",
+                        params,
+                    )
+                    conn.commit()
+                # Return existing action ID so caller knows it's reused
+                return existing_id
+
             # Use the existing table schema
             cursor.execute(
                 """
@@ -307,23 +349,34 @@ def get_actions_due_for_execution(db_path: str | Path) -> List[Dict[str, Any]]:
             for row in cursor.fetchall():
                 # Map from the table's columns to our expected dictionary format
                 # Map proposed_action to our ActionType enum
-                action_type_str = row[5]  # proposed_action
-                action_type = None
-                if action_type_str == "delete":
+                proposed_action_raw = row[5]  # proposed_action column may hold various historical values
+                normalized_action = str(proposed_action_raw).lower().strip() if proposed_action_raw else ""
+
+                # Map historical/legacy strings to canonical actions
+                if normalized_action in {"delete", "remove", "purge"}:
                     action_type = ActionType.DELETE
-                elif action_type_str == "relabel":
+                    proposed_action = "delete"
+                elif normalized_action.startswith("label") or normalized_action.startswith("relabel"):
+                    # Handles strings like "label as othercat" or "relabel"
                     action_type = ActionType.RELABEL
-                elif action_type_str == "manual_review":
+                    proposed_action = "relabel"
+                elif normalized_action in {"manual_review", "manualreview", "review"}:
                     action_type = ActionType.MANUAL_REVIEW
+                    proposed_action = "manual_review"
                 else:
                     action_type = ActionType.UNKNOWN
+                    proposed_action = "unknown"
 
-                # Build parameters from action_details if available
+                # Build parameters for callbacks
                 action_params = None
-                if row[6]:  # action_details
-                    if action_type == ActionType.RELABEL:
-                        # Create a JSON string with the label information
-                        action_params = json.dumps({"label": row[6]})
+                if action_type == ActionType.RELABEL:
+                    param_dict: dict[str, str] = {}
+                    if row[2]:  # torrent_id (hash) present in the row
+                        param_dict["torrent_id"] = row[2]
+                    if row[6]:  # action_details (label)
+                        param_dict["label"] = row[6]
+                    if param_dict:
+                        action_params = json.dumps(param_dict)
 
                 pending_actions.append(
                     {
@@ -333,7 +386,7 @@ def get_actions_due_for_execution(db_path: str | Path) -> List[Dict[str, Any]]:
                         "file_path": row[3],
                         "current_label": row[4],
                         "action_type": action_type,
-                        "proposed_action": row[5],  # Keep the original string value too
+                        "proposed_action": proposed_action,
                         "action_params": action_params,
                         "action_details": row[6],
                         "size_human": row[7],
@@ -377,6 +430,14 @@ def update_action_status(
     """
     db_path = str(db_path)
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Normalize new_status to a lowercase string so comparisons and DB storage are
+    # consistent regardless of whether the caller passes an ActionStatus enum
+    # instance or a plain string.
+    if isinstance(new_status, ActionStatus):
+        new_status = new_status.name.lower()
+    else:
+        new_status = str(new_status).lower()
 
     try:
         with sqlite3.connect(db_path) as conn:
@@ -538,6 +599,23 @@ def execute_pending_actions(
         action_id = action["id"]
         file_path = action["file_path"]
         action_type = action["action_type"]
+        proposed_action = action.get("proposed_action")
+
+        # If action_type could not be resolved earlier, try to infer it from proposed_action
+        if action_type == ActionType.UNKNOWN and isinstance(proposed_action, str):
+            pa = proposed_action.lower().strip()
+            if pa == "delete":
+                action_type = ActionType.DELETE
+            elif pa == "relabel":
+                action_type = ActionType.RELABEL
+            elif pa == "manual_review":
+                action_type = ActionType.MANUAL_REVIEW
+        # Normalize action_type to an enum instance for consistent comparison
+        if isinstance(action_type, str):
+            try:
+                action_type = ActionType[action_type.upper()]
+            except KeyError:
+                action_type = ActionType.UNKNOWN
         action_params = action["action_params"]
 
         try:
@@ -546,7 +624,7 @@ def execute_pending_actions(
                 update_action_status(db_path, action_id, ActionStatus.READY)
 
             # Execute based on action type
-            if action_type == ActionType.DELETE.name:
+            if action_type == ActionType.DELETE:
                 if dry_run:
                     logger.info(f"[DRY RUN] Would delete file: {file_path}")
                 else:
@@ -560,21 +638,31 @@ def execute_pending_actions(
                         update_action_status(db_path, action_id, ActionStatus.PENDING, f"Failed to delete file: {file_path}")
                         failed_count += 1
 
-            elif action_type == ActionType.RELABEL.name:
+            elif action_type == ActionType.RELABEL:
                 if dry_run:
                     logger.info(f"[DRY RUN] Would apply label to torrent: {file_path}")
                 else:
                     logger.info(f"Applying label to torrent: {file_path}")
-                    success = apply_relabel_callback(file_path, action_params)
+                    result = apply_relabel_callback(file_path, action_params)
+                    # Callback may return bool or tuple[bool, str|None]
+                    if isinstance(result, tuple):
+                        success_flag, reason = result
+                    else:
+                        success_flag, reason = bool(result), None
 
-                    if success:
+                    if success_flag:
                         update_action_status(db_path, action_id, ActionStatus.COMPLETED)
                         successful_count += 1
                     else:
-                        update_action_status(db_path, action_id, ActionStatus.PENDING, f"Failed to apply label to torrent: {file_path}")
+                        if reason == "not_found":
+                            # Torrent no longer exists; cancel further retries
+                            update_action_status(db_path, action_id, ActionStatus.CANCELLED, "Torrent no longer exists in Deluge")
+                        else:
+                            # Keep as pending for other failures so it can be retried
+                            update_action_status(db_path, action_id, ActionStatus.PENDING, f"Failed to apply label to torrent: {file_path}")
                         failed_count += 1
 
-            elif action_type == ActionType.MANUAL_REVIEW.name:
+            elif action_type == ActionType.MANUAL_REVIEW:
                 # Manual review actions just get logged, they can't be automated
                 logger.info(f"File requires manual review: {file_path}")
                 skipped_count += 1
