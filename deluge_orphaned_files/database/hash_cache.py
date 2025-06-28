@@ -83,7 +83,7 @@ def init_sqlite_cache(db_path: str | Path) -> None:
         success = False
         for attempt in range(1, 4):  # Try up to 3 times
             try:
-                logger.info(f"Attempt {attempt} to update database schema...")
+                logger.debug(f"Attempt {attempt} to update database schema...")
                 # Use context manager for connection handling
                 with sqlite3.connect(db_path) as conn:
                     conn.isolation_level = None  # Set autocommit mode for DDL statements
@@ -129,7 +129,7 @@ def init_sqlite_cache(db_path: str | Path) -> None:
                         except sqlite3.Error:
                             pass  # Ignore rollback error
                 else:
-                    logger.info("hash_algorithm column already exists in file_hashes table")
+                    logger.debug("hash_algorithm column already exists in file_hashes table")
                     success = True
                     break
             except sqlite3.Error as alter_exc:
@@ -182,7 +182,7 @@ def init_sqlite_cache(db_path: str | Path) -> None:
 
         # Final check
         if success:
-            logger.info("Database schema is up to date with hash_algorithm column")
+            logger.debug("Database schema is up to date with hash_algorithm column")
         else:
             logger.error("Failed to update database schema with hash_algorithm column after all attempts")
             # Force check again

@@ -227,7 +227,13 @@ def get_local_files(
                 file_hash = cached["hash"]
                 hash_algorithm = cached.get("hash_algorithm") or infer_algorithm_from_hash(cached["hash"])
             else:
-                file_hash, hash_algorithm = get_file_hash(Path(full_path_str), no_progress=no_progress)
+                try:
+                    file_hash, hash_algorithm = get_file_hash(Path(full_path_str), no_progress=no_progress)
+                except FileNotFoundError:
+                    # The file was removed between the initial directory walk and hashing
+                    logger.warning("File disappeared before hashing: {}", full_path_str)
+                    bar.update(1)  # Maintain accurate progress bar count
+                    continue
                 new_hashes += 1
 
                 # Update in-memory cache
