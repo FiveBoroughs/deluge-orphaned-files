@@ -33,7 +33,7 @@ from .scanning.file_scanner import (
     save_hash_cache as scan_save_hash_cache,
     load_hashes_from_sqlite as scan_load_hashes_from_sqlite,
 )
-from .database.hash_cache import (
+from .database.hash_cache import (  # noqa: F401 – some imports are kept for backward compatibility
     init_sqlite_cache as db_init_sqlite_cache,
     load_hashes_from_sqlite as db_load_hashes_from_sqlite,
     upsert_hash_to_sqlite as db_upsert_hash_to_sqlite,
