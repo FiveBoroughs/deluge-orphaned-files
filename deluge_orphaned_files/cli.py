@@ -1513,7 +1513,7 @@ def migrate_json_to_sqlite(no_progress: bool = False):
     logger.info("Starting migration of JSON hash caches to SQLite database...")
 
     # Initialize the SQLite database
-    db_init_sqlite_cache(str(config.sqlite_cache_path))  # Use db version for schema migration
+    init_sqlite_cache(str(config.sqlite_cache_path))  # Initialize full database schema
 
     folders_to_migrate = [
         (config.local_torrent_base_local_folder, "torrent folder"),
@@ -2207,7 +2207,7 @@ def main() -> None:
 
     if args.sqlite:
         logger.debug(f"Initializing SQLite database schema at {config.sqlite_cache_path}")
-        db_init_sqlite_cache(str(config.sqlite_cache_path))  # Use db version for schema migration
+        init_sqlite_cache(str(config.sqlite_cache_path))  # Initialize full database schema
 
     # Email test
     if args.test_email:
@@ -2401,7 +2401,7 @@ save_hash_cache = scan_save_hash_cache  # type: ignore  # noqa: F401,F811
 load_hashes_from_sqlite = scan_load_hashes_from_sqlite  # type: ignore  # noqa: F401,F811
 
 # Override database hash helpers too (gradual deprecation of local copies)
-init_sqlite_cache = db_init_sqlite_cache  # type: ignore  # noqa: F401,F811
+# NOTE: Retain full schema initializer; minimal helper already available as db_init_sqlite_cache
 load_hashes_from_sqlite = db_load_hashes_from_sqlite  # type: ignore  # noqa: F401,F811
 upsert_hash_to_sqlite = db_upsert_hash_to_sqlite  # type: ignore  # noqa: F401,F811
 
