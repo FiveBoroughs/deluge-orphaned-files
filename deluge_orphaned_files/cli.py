@@ -1903,38 +1903,128 @@ def process_autoremove_labeling(
         logger.info(f"No torrents found needing the '{target_label_prefix}' label based on the latest scan data.")
         return
 
+    # ------------------------------------------------------------------
+    # Build a quick lookup of how many files are missing per torrent so
+    # we can decide later if the torrent is *fully* orphaned or only
+    # partially so (e.g. a single episode missing from a season pack).
+    # We will only relabel torrents where ALL files are missing.
+    # ------------------------------------------------------------------
+    missing_counts: Dict[str, int] = {}
+    for _row in files_to_process:
+        tid = _row.get("torrent_id")
+        if tid:
+            missing_counts[tid] = missing_counts.get(tid, 0) + 1
+
     # Calculate the due date for the actions with a safe fallback value
     relabel_delay = getattr(config, "relabel_action_delay_days", 7)  # Default 7 days if not set
     action_due_at = datetime.now(timezone.utc) + timedelta(days=relabel_delay)
 
     logger.info(f"Found {len(files_to_process)} torrents to potentially label with '{target_label_prefix}'.")
 
-    processed_torrent_hashes = set()
+    processed_torrent_hashes: set[str] = set()
     actions_recorded_count = 0
     actions_would_be_recorded_count = 0
 
     for item in files_to_process:
-        orphaned_file_id = item.get("file_id")
-        torrent_id = item.get("torrent_id")
-        current_label = item.get("label", "")
-        file_path = item.get("path", "Unknown path")
+        orphaned_file_id: int | None = item.get("file_id")
+        torrent_id: str | None = item.get("torrent_id")
+        current_label: str = item.get("label", "")
+        file_path: str = item.get("path", "Unknown path")
 
         if not torrent_id:
             logger.warning(f"Item for path '{file_path}' missing 'torrent_id', skipping labeling.")
             continue
 
-        if not orphaned_file_id:
+        if orphaned_file_id is None:
             logger.warning(f"Item for path '{file_path}' missing 'file_id', skipping labeling.")
             continue
 
         if torrent_id in processed_torrent_hashes:
-            # Avoid processing the same torrent multiple times if it has multiple files
+            # Avoid processing the same torrent multiple times if it has multiple orphaned files
             continue
 
         processed_torrent_hashes.add(torrent_id)
 
+        # ------------------------------------------------------------------
+        # Only relabel if *all* files of the torrent are missing from media.
+        # This prevents a full season torrent from being relabeled when a
+        # single episode has gone missing.
+        # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Determine how many *eligible* files (i.e. not black-listed by
+        # extension) belong to this torrent so that we compare apples to
+        # apples with the orphaned-file count we already have (which was
+        # built after applying the same blacklist during scanning).
+        # ------------------------------------------------------------------
+        try:
+            status = client.call("core.get_torrent_status", torrent_id, ["files"])
+            files_meta = status.get(b"files") or status.get("files")  # Deluge may return bytes keys
+
+            eligible_total = 0
+            iterable_meta: list[Any] | None = None
+            if isinstance(files_meta, (list, tuple)):
+                iterable_meta = list(files_meta)  # Convert tuple to list for uniform handling
+            elif isinstance(files_meta, dict):
+                # Deluge ≤2.1 returns a dict mapping index→file_meta
+                iterable_meta = list(files_meta.values())
+            else:
+                logger.debug("Unexpected files metadata for torrent {}: {} (value preview: {})", torrent_id, type(files_meta), str(files_meta)[:120])
+
+            if iterable_meta is not None:
+                for fmeta in iterable_meta:
+                    raw_path = fmeta.get(b"path") if b"path" in fmeta else fmeta.get("path")
+                    if raw_path is None:
+                        continue
+                    path_str = raw_path.decode() if isinstance(raw_path, bytes) else str(raw_path)
+                    suffix = Path(path_str).suffix.lower()
+                    name = Path(path_str).name
+                    # Extension or filename blacklist
+                    if suffix in config.extensions_blacklist or name in config.extensions_blacklist:
+                        continue
+                    # Sample/extras path patterns (case-insensitive)
+                    path_lower = path_str.lower().replace(os.sep, "/")
+                    if any(pat in path_lower for pat in ("/sample", "/featurettes", "/extras", ".sample", "-sample")):
+                        continue
+                    # Minimum size filter (Deluge file list gives size in bytes)
+                    size_val = fmeta.get(b"size") if b"size" in fmeta else fmeta.get("size")
+                    try:
+                        size_int = int(size_val) if size_val is not None else 0
+                    except Exception:  # noqa: BLE001 – guard against weird types
+                        size_int = 0
+                    if size_int < config.min_file_size_mb * 1024 * 1024:
+                        continue
+                    eligible_total += 1
+        except Exception as exc:
+            logger.debug("Could not retrieve file list for torrent {}: {}", torrent_id, exc)
+            eligible_total = 0
+
+        missing_count = missing_counts.get(torrent_id, 0)
+
+        if eligible_total == 0:
+            logger.debug(
+                "Torrent ID {} returned no eligible files after filtering (missing {}). Skipping relabel.",
+                torrent_id,
+                missing_count,
+            )
+            continue
+
+        if missing_count < eligible_total:
+            logger.debug(
+                "Torrent ID {} not fully orphaned after extension filter ({}/{}) files missing. Skipping relabel.",
+                torrent_id,
+                missing_count,
+                eligible_total,
+            )
+            continue
+
         if current_label and current_label.startswith(target_label_prefix):
-            logger.debug(f"Torrent ID {torrent_id} (file: {file_path}) already has label '{current_label}' starting with '{target_label_prefix}'. Skipping.")
+            logger.debug(
+                "Torrent ID {} (file: {}) already has label '{}' starting with '{}'. Skipping.",
+                torrent_id,
+                file_path,
+                current_label,
+                target_label_prefix,
+            )
             continue
 
         if apply_labels:
