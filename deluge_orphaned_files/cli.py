@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -14,7 +15,7 @@ if TYPE_CHECKING:  # pragma: no cover
 import argparse
 import sqlite3
 from loguru import logger
-import sys  # For stdout logging
+
 from typing import List, Dict, Any, Optional, Tuple, Set
 from pydantic import (
     Field,
@@ -59,7 +60,31 @@ from . import __version__
 # ---------------------------------------------------------------------------
 # Configure Loguru – log to console and to config/logs/deluge_orphaned_files.log
 # ---------------------------------------------------------------------------
+# Early --list-env handling (dump AppConfig values)
+# ---------------------------------------------------------------------------
+if "--list-env" in sys.argv:
+    try:
+        from .settings import config as _cfg  # Local import to build AppConfig
 
+        masked: dict[str, str] = {}
+        for key, value in _cfg.model_dump(mode="python", exclude_defaults=False).items():
+            if value is None:
+                display = "NOT SET"
+            elif any(s in key.lower() for s in ("password", "token", "secret")):
+                display = "***"
+            else:
+                display = str(value)
+            masked[key] = display
+        print("\nLoaded configuration (masked):")
+        print(json.dumps(masked, indent=2))
+    except Exception as exc:  # noqa: BLE001
+        print("Failed to load AppConfig – validation errors below:\n")
+        print(exc)
+    sys.exit(0)
+
+# ---------------------------------------------------------------------------
+# Misc helper
+# ---------------------------------------------------------------------------
 # Allow override via environment variable; fallback to ./config/logs inside the
 # project (works both in Docker and local checkout)
 log_dir_env = os.getenv("APP_LOG_DIR")
@@ -105,6 +130,26 @@ def print_version_info() -> None:
     Outputs version information to the logger at INFO level.
     """
     logger.info("Deluge Orphaned Files v{}", __version__)
+
+
+def print_loaded_env_vars(cfg: "AppConfig") -> None:  # noqa: F821 – forward ref for type checkers
+    """Pretty-print the environment variables that populated *cfg*.
+
+    Sensitive values like passwords or tokens are masked. Fields that are ``None``
+    are reported as *NOT SET* so users can quickly see what is missing.
+    """
+    masked: dict[str, str] = {}
+    for key, value in cfg.model_dump(mode="python", exclude_defaults=False).items():  # type: ignore[arg-type]
+        if value is None:
+            display = "NOT SET"
+        elif any(s in key.lower() for s in ("password", "token", "secret")):
+            display = "***"
+        else:
+            display = str(value)
+        masked[key] = display
+
+    print("\nLoaded configuration (masked):")
+    print(json.dumps(masked, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -2115,8 +2160,19 @@ def main() -> None:
     log_group = parser.add_argument_group("Logging Options")
     log_group.add_argument("--debug", action="store_true", help="Enable debug logging")
     log_group.add_argument("--trace", action="store_true", help="Enable trace logging (most verbose)")
+    log_group.add_argument(
+        "--list-env",
+        dest="list_env",
+        action="store_true",
+        help="List loaded environment variables (masked) and exit",
+    )
 
     args = parser.parse_args()
+
+    # Early-exit helper flags -------------------------------------------------
+    if args.list_env:
+        print_loaded_env_vars(config)
+        return
 
     if args.debug:
         logger.remove()
