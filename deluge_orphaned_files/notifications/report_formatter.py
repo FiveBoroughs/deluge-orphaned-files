@@ -10,6 +10,8 @@ from typing import Optional
 from loguru import logger
 from prettytable import PrettyTable
 
+from .. import __version__
+
 __all__ = ["format_scan_results"]
 
 
@@ -91,6 +93,7 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
 
     header_lines = [
         f"Scan ID: {scan_id}",
+        f"Version: {__version__}",
         f"Host: {host}",
         f"Base Path: {base_path}",
         f"Scan Start: {scan_start}",
