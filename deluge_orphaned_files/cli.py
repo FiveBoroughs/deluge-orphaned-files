@@ -4,7 +4,7 @@ import os
 import sys
 import json
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from .deluge.client import get_deluge_files as deluge_get_files
 from tqdm import tqdm
 from typing import TYPE_CHECKING
@@ -42,9 +42,7 @@ from .logic.orphan_finder import compute_orphans
 from .logic.autoremove import process_autoremove_labeling
 from .logic.pending_actions import (
     init_pending_actions_schema,
-    register_pending_action,
     execute_pending_actions as execute_all_pending_actions,
-    ActionType,
 )
 from .logic.retention import (
     get_files_to_mark_for_deletion as retention_get_files_to_mark,
