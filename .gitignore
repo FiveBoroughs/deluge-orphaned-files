@@ -30,3 +30,6 @@ Thumbs.db
 # Ignore IDE-specific files
 .vscode/
 .idea/
+
+# Ignore local temp artifacts
+.tmp/
