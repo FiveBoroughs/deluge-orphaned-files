@@ -76,6 +76,8 @@ def init_pending_actions_schema(db_path: str | Path) -> None:
                     proposed_action TEXT NOT NULL,
                     action_details TEXT,
                     size_human TEXT NOT NULL,
+                    source TEXT,
+                    file_size INTEGER,
                     scan_id_identified INTEGER NOT NULL,
                     identified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     action_due_at TIMESTAMP NOT NULL,
@@ -174,7 +176,11 @@ def register_pending_action(
     action_due_at_str = action_due_at.strftime("%Y-%m-%d %H:%M:%S")  # Format expected by report_formatter
 
     # Map ActionType enum to proposed_action string values expected by existing code
-    proposed_action_map = {ActionType.DELETE: "delete", ActionType.RELABEL: "relabel", ActionType.MANUAL_REVIEW: "manual_review"}
+    proposed_action_map = {
+        ActionType.DELETE: "delete",
+        ActionType.RELABEL: "relabel",
+        ActionType.MANUAL_REVIEW: "manual_review",
+    }
     proposed_action = proposed_action_map.get(action_type, "unknown")
 
     # Extract action details from the JSON params if provided
@@ -207,21 +213,59 @@ def register_pending_action(
             # -------------------------------------------------------------
             cursor.execute(
                 """
-                SELECT id, size_human, current_label
+                SELECT id, size_human, current_label, torrent_id
                 FROM pending_actions
                 WHERE file_path = ? AND proposed_action = ? AND status = 'pending'
-                LIMIT 1
                 """,
                 (file_path, proposed_action),
             )
-            existing_row = cursor.fetchone()
-            if existing_row:
-                existing_id, existing_size_human, existing_current_label = existing_row
+            duplicate_rows = cursor.fetchall()
+
+            existing_id: int | None = None
+            existing_size_human: str | None = None
+            existing_current_label: str | None = None
+            existing_torrent_id: str | None = None
+
+            for (
+                row_id,
+                row_size_human,
+                row_current_label,
+                row_torrent_id,
+            ) in duplicate_rows:
+                if torrent_hash:
+                    if row_torrent_id == torrent_hash:
+                        existing_id = row_id
+                        existing_size_human = row_size_human
+                        existing_current_label = row_current_label
+                        existing_torrent_id = row_torrent_id
+                        break
+                else:
+                    if not row_torrent_id:
+                        existing_id = row_id
+                        existing_size_human = row_size_human
+                        existing_current_label = row_current_label
+                        existing_torrent_id = row_torrent_id
+                        break
+
+            # Backward compatibility: if we didn't find a hash-specific match but have legacy rows, reuse the first one
+            if existing_id is None and duplicate_rows and not torrent_hash:
+                (
+                    existing_id,
+                    existing_size_human,
+                    existing_current_label,
+                    existing_torrent_id,
+                ) = duplicate_rows[0]
+
+            if existing_id is not None:
                 update_fields: list[str] = []
                 params: list[Any] = []
 
                 # Patch size_human if we now have a better value
-                if size_human not in (None, "", "Unknown") and existing_size_human in (None, "", "Unknown"):
+                if size_human not in (None, "", "Unknown") and existing_size_human in (
+                    None,
+                    "",
+                    "Unknown",
+                ):
                     update_fields.append("size_human = ?")
                     params.append(size_human)
 
@@ -229,6 +273,11 @@ def register_pending_action(
                 if current_label and current_label != existing_current_label:
                     update_fields.append("current_label = ?")
                     params.append(current_label)
+
+                # Store torrent hash if we just matched a legacy row without it
+                if torrent_hash and not existing_torrent_id:
+                    update_fields.append("torrent_id = ?")
+                    params.append(torrent_hash)
 
                 if update_fields:
                     params.append(existing_id)
@@ -248,7 +297,18 @@ def register_pending_action(
                  action_details, size_human, scan_id_identified, identified_at, action_due_at, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)
             """,
-                (orphaned_file_id, torrent_hash, file_path, current_label, proposed_action, action_details, size_human, scan_id, action_due_at_str, "pending"),  # torrent_id in the database
+                (
+                    orphaned_file_id,
+                    torrent_hash,
+                    file_path,
+                    current_label,
+                    proposed_action,
+                    action_details,
+                    size_human,
+                    scan_id,
+                    action_due_at_str,
+                    "pending",
+                ),  # torrent_id in the database
             )
 
             action_id = cursor.lastrowid
@@ -269,7 +329,10 @@ def register_pending_action(
 
                 if updates:
                     params.append(action_id)
-                    cursor.execute(f"UPDATE pending_actions SET {', '.join(updates)} WHERE id = ?", params)
+                    cursor.execute(
+                        f"UPDATE pending_actions SET {', '.join(updates)} WHERE id = ?",
+                        params,
+                    )
                     conn.commit()
 
             logger.info(f"Registered pending {proposed_action} action for {file_path}, due at {action_due_at_str}")
@@ -455,11 +518,20 @@ def update_action_status(
 
                 cursor.execute(
                     "UPDATE pending_actions SET status = ?, processed_at = ?, processing_notes = ?, scan_id_processed = ? WHERE id = ?",
-                    (new_status, now_str, processing_notes, scan_id_processed, action_id),
+                    (
+                        new_status,
+                        now_str,
+                        processing_notes,
+                        scan_id_processed,
+                        action_id,
+                    ),
                 )
             else:
                 # For non-terminal states, just update the status
-                cursor.execute("UPDATE pending_actions SET status = ? WHERE id = ?", (new_status, action_id))
+                cursor.execute(
+                    "UPDATE pending_actions SET status = ? WHERE id = ?",
+                    (new_status, action_id),
+                )
 
             conn.commit()
             return cursor.rowcount > 0
@@ -635,7 +707,12 @@ def execute_pending_actions(
                         update_action_status(db_path, action_id, ActionStatus.COMPLETED)
                         successful_count += 1
                     else:
-                        update_action_status(db_path, action_id, ActionStatus.PENDING, f"Failed to delete file: {file_path}")
+                        update_action_status(
+                            db_path,
+                            action_id,
+                            ActionStatus.PENDING,
+                            f"Failed to delete file: {file_path}",
+                        )
                         failed_count += 1
 
             elif action_type == ActionType.RELABEL:
@@ -656,10 +733,20 @@ def execute_pending_actions(
                     else:
                         if reason == "not_found":
                             # Torrent no longer exists; cancel further retries
-                            update_action_status(db_path, action_id, ActionStatus.CANCELLED, "Torrent no longer exists in Deluge")
+                            update_action_status(
+                                db_path,
+                                action_id,
+                                ActionStatus.CANCELLED,
+                                "Torrent no longer exists in Deluge",
+                            )
                         else:
                             # Keep as pending for other failures so it can be retried
-                            update_action_status(db_path, action_id, ActionStatus.PENDING, f"Failed to apply label to torrent: {file_path}")
+                            update_action_status(
+                                db_path,
+                                action_id,
+                                ActionStatus.PENDING,
+                                f"Failed to apply label to torrent: {file_path}",
+                            )
                         failed_count += 1
 
             elif action_type == ActionType.MANUAL_REVIEW:
@@ -671,7 +758,12 @@ def execute_pending_actions(
                 # Unknown action type
                 logger.warning(f"Unknown action type {action_type} for file {file_path}")
                 if not dry_run:
-                    update_action_status(db_path, action_id, ActionStatus.CANCELLED, f"Unknown action type: {action_type}")
+                    update_action_status(
+                        db_path,
+                        action_id,
+                        ActionStatus.CANCELLED,
+                        f"Unknown action type: {action_type}",
+                    )
                 skipped_count += 1
 
         except Exception as e:

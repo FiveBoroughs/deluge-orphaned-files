@@ -11,7 +11,7 @@ import json
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Dict, Any
+from typing import TYPE_CHECKING, List, Dict, Any, Set
 from loguru import logger
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -23,7 +23,13 @@ from .pending_actions import register_pending_action, ActionType
 __all__ = ["process_autoremove_labeling"]
 
 
-def process_autoremove_labeling(client: "DelugeRPCClient", scan_id: int, db_path: str | Path, dry_run: bool = True, target_label_prefix: str = None) -> Dict[str, Any]:
+def process_autoremove_labeling(
+    client: "DelugeRPCClient",
+    scan_id: int,
+    db_path: str | Path,
+    dry_run: bool = True,
+    target_label_prefix: str = None,
+) -> Dict[str, Any]:
     """Process auto-remove labeling with cross-seed coordination.
 
     This function identifies torrents that should be labeled with the auto-remove
@@ -48,7 +54,14 @@ def process_autoremove_labeling(client: "DelugeRPCClient", scan_id: int, db_path
     if target_label_prefix is None:
         target_label_prefix = config.deluge_autoremove_label
 
-    stats = {"torrents_processed": 0, "labels_applied": 0, "content_groups_found": 0, "cross_seed_groups_coordinated": 0, "errors": 0, "dry_run": dry_run}
+    stats = {
+        "torrents_processed": 0,
+        "labels_applied": 0,
+        "content_groups_found": 0,
+        "cross_seed_groups_coordinated": 0,
+        "errors": 0,
+        "dry_run": dry_run,
+    }
 
     if not client or not client.connected:
         logger.error("Deluge client is not connected")
@@ -77,6 +90,9 @@ def process_autoremove_labeling(client: "DelugeRPCClient", scan_id: int, db_path
             target_label_prefix,
         )
 
+        # Track cross-seed torrents we've already queued so we don't duplicate work when the same torrent appears in multiple groups
+        processed_cross_seed_torrents: Set[str] = set()
+
         # Step 4: Process each content group (apply labels to entire groups)
         for content_path, group_info in content_groups.items():
             group_torrents = group_info["torrents"]
@@ -84,12 +100,22 @@ def process_autoremove_labeling(client: "DelugeRPCClient", scan_id: int, db_path
 
             if has_cross_seeds:
                 stats["cross_seed_groups_coordinated"] += 1
-                logger.info("Processing cross-seed group for content: {} ({} torrents)", content_path, len(group_torrents))
+                logger.info(
+                    "Processing cross-seed group for content: {} ({} torrents)",
+                    content_path,
+                    len(group_torrents),
+                )
 
             # Process all torrents in this content group
             for torrent in group_torrents:
                 success = _process_single_torrent_for_labeling(
-                    db_path=db_path, torrent=torrent, target_label_prefix=target_label_prefix, scan_id=scan_id, dry_run=dry_run, is_cross_seed_group=has_cross_seeds
+                    db_path=db_path,
+                    torrent=torrent,
+                    target_label_prefix=target_label_prefix,
+                    scan_id=scan_id,
+                    dry_run=dry_run,
+                    is_cross_seed_group=has_cross_seeds,
+                    processed_cross_seed_torrents=processed_cross_seed_torrents,
                 )
 
                 stats["torrents_processed"] += 1
@@ -166,7 +192,16 @@ def _get_autoremove_candidates(db_path: Path, scan_id: int, target_label_prefix:
             )
 
             for row in cursor.fetchall():
-                candidates.append({"file_id": row[0], "file_path": row[1], "torrent_id": row[2], "file_size": row[3], "size_human": row[4], "current_label": row[5]})
+                candidates.append(
+                    {
+                        "file_id": row[0],
+                        "file_path": row[1],
+                        "torrent_id": row[2],
+                        "file_size": row[3],
+                        "size_human": row[4],
+                        "current_label": row[5],
+                    }
+                )
 
         logger.debug("Found {} candidate files for auto-remove labeling", len(candidates))
 
@@ -197,7 +232,12 @@ def _get_all_deluge_torrents(client: "DelugeRPCClient") -> Dict[str, Dict[str, A
                 torrent_info = client.core.get_torrent_status(torrent_id, ["name", "files", "label", "state"])
 
                 if torrent_info and torrent_info.get("files"):
-                    all_torrents[torrent_id] = {"name": torrent_info["name"], "label": torrent_info.get("label", ""), "state": torrent_info.get("state", ""), "files": torrent_info["files"]}
+                    all_torrents[torrent_id] = {
+                        "name": torrent_info["name"],
+                        "label": torrent_info.get("label", ""),
+                        "state": torrent_info.get("state", ""),
+                        "files": torrent_info["files"],
+                    }
 
             except Exception as exc:
                 logger.debug("Error getting info for torrent {}: {}", torrent_id, exc)
@@ -211,7 +251,10 @@ def _get_all_deluge_torrents(client: "DelugeRPCClient") -> Dict[str, Dict[str, A
     return all_torrents
 
 
-def _group_torrents_by_content(candidate_files: List[Dict[str, Any]], all_deluge_torrents: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _group_torrents_by_content(
+    candidate_files: List[Dict[str, Any]],
+    all_deluge_torrents: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
     """Group torrents by their content paths to detect cross-seed relationships.
 
     Args:
@@ -292,7 +335,10 @@ def _group_torrents_by_content(candidate_files: List[Dict[str, Any]], all_deluge
         labels = [t["current_label"] for t in torrents_list if t["current_label"]]
         has_cross_seed_labels = any(".cross-seed" in label for label in labels)
 
-        content_groups[content_path] = {"torrents": torrents_list, "has_cross_seeds": has_cross_seeds or has_cross_seed_labels}
+        content_groups[content_path] = {
+            "torrents": torrents_list,
+            "has_cross_seeds": has_cross_seeds or has_cross_seed_labels,
+        }
 
     return content_groups
 
@@ -321,7 +367,15 @@ def _normalize_content_path(file_path: str) -> str:
         return path.stem
 
 
-def _process_single_torrent_for_labeling(db_path: Path, torrent: Dict[str, Any], target_label_prefix: str, scan_id: int, dry_run: bool, is_cross_seed_group: bool) -> bool:
+def _process_single_torrent_for_labeling(
+    db_path: Path,
+    torrent: Dict[str, Any],
+    target_label_prefix: str,
+    scan_id: int,
+    dry_run: bool,
+    is_cross_seed_group: bool,
+    processed_cross_seed_torrents: Set[str],
+) -> bool:
     """Process a single torrent for auto-remove labeling.
 
     Args:
@@ -331,6 +385,7 @@ def _process_single_torrent_for_labeling(db_path: Path, torrent: Dict[str, Any],
         scan_id: ID of the originating scan.
         dry_run: If True, only log what would be done.
         is_cross_seed_group: True if this torrent is part of a cross-seed group.
+        processed_cross_seed_torrents: Hashes of cross-seed torrents we have already queued during this run.
 
     Returns:
         True if successful, False otherwise.
@@ -339,6 +394,7 @@ def _process_single_torrent_for_labeling(db_path: Path, torrent: Dict[str, Any],
     file_path = torrent["file_path"]
     current_label = torrent["current_label"]
     file_id = torrent["file_id"]
+    is_candidate = torrent.get("is_candidate", False)
 
     # Skip if torrent already has the target label
     if current_label and current_label.lower().startswith(target_label_prefix.lower()):
@@ -352,16 +408,51 @@ def _process_single_torrent_for_labeling(db_path: Path, torrent: Dict[str, Any],
 
     try:
         if dry_run:
-            if is_cross_seed_group:
-                logger.info("DRY RUN: Would label torrent {} with '{}' (cross-seed group) (file: {})", torrent_id[:8], target_label_prefix, file_path)
+            if not is_candidate:
+                if torrent_id in processed_cross_seed_torrents:
+                    logger.debug(
+                        "DRY RUN: Already considered cross-seed torrent {} for labeling (file: {}). Skipping duplicate entry.",
+                        torrent_id[:8],
+                        file_path,
+                    )
+                    return True
+
+                processed_cross_seed_torrents.add(torrent_id)
+                logger.info(
+                    "DRY RUN: Would coordinate cross-seed labeling for torrent {} with '{}' (file: {}). Previous label: '{}'",
+                    torrent_id[:8],
+                    target_label_prefix,
+                    file_path,
+                    current_label or "none",
+                )
             else:
-                logger.info("DRY RUN: Would label torrent {} with '{}' (file: {})", torrent_id[:8], target_label_prefix, file_path)
+                if is_cross_seed_group:
+                    logger.info(
+                        "DRY RUN: Would label torrent {} with '{}' (cross-seed group) (file: {})",
+                        torrent_id[:8],
+                        target_label_prefix,
+                        file_path,
+                    )
+                else:
+                    logger.info(
+                        "DRY RUN: Would label torrent {} with '{}' (file: {})",
+                        torrent_id[:8],
+                        target_label_prefix,
+                        file_path,
+                    )
+
             return True
 
         # Only record pending actions for candidates (files in our database)
-        if torrent["is_candidate"] and file_id:
+        if is_candidate and file_id:
             # Prepare action params as JSON
-            action_params = json.dumps({"torrent_id": torrent_id, "label": target_label_prefix, "current_label": current_label})
+            action_params = json.dumps(
+                {
+                    "torrent_id": torrent_id,
+                    "label": target_label_prefix,
+                    "current_label": current_label,
+                }
+            )
 
             # Register the pending action
             register_pending_action(
@@ -387,15 +478,63 @@ def _process_single_torrent_for_labeling(db_path: Path, torrent: Dict[str, Any],
                     current_label or "none",
                 )
             else:
-                logger.info("Recorded pending action to apply label '{}' to torrent {} (file: {}). Previous label: '{}'", target_label_prefix, torrent_id[:8], file_path, current_label or "none")
+                logger.info(
+                    "Recorded pending action to apply label '{}' to torrent {} (file: {}). Previous label: '{}'",
+                    target_label_prefix,
+                    torrent_id[:8],
+                    file_path,
+                    current_label or "none",
+                )
         else:
-            # For non-candidates (related torrents), log what we would do
-            # but don't record pending actions since they're not in our orphan database
-            if is_cross_seed_group:
-                logger.info("Would coordinate cross-seed labeling for torrent {} with '{}' (file: {}). Previous label: '{}'", torrent_id[:8], target_label_prefix, file_path, current_label or "none")
+            # For non-candidates (related torrents), queue pending actions so clones are relabeled too
+            if torrent_id in processed_cross_seed_torrents:
+                logger.debug(
+                    "Skipping duplicate cross-seed torrent {} for labeling coordination (file: {}).",
+                    torrent_id[:8],
+                    file_path,
+                )
+                return True
+
+            processed_cross_seed_torrents.add(torrent_id)
+
+            action_params = json.dumps(
+                {
+                    "torrent_id": torrent_id,
+                    "label": target_label_prefix,
+                    "current_label": current_label,
+                    "cross_seed": True,
+                }
+            )
+
+            register_pending_action(
+                db_path=db_path,
+                file_path=file_path,
+                action_type=ActionType.RELABEL,
+                waiting_period_days=config.relabel_action_delay_days,
+                action_params=action_params,
+                scan_id=str(scan_id),
+                orphaned_file_id=None,
+                torrent_hash=torrent_id,
+                file_size=torrent.get("file_size"),
+                source="cross_seed",
+                size_human=torrent.get("size_human"),
+            )
+
+            logger.info(
+                "Recorded cross-seed pending action to apply label '{}' to torrent {} (file: {}). Previous label: '{}'",
+                target_label_prefix,
+                torrent_id[:8],
+                file_path,
+                current_label or "none",
+            )
 
         return True
 
     except Exception as exc:
-        logger.error("Error processing torrent {} (file: {}): {}", torrent_id[:8] if torrent_id else "unknown", file_path, exc)
+        logger.error(
+            "Error processing torrent {} (file: {}): {}",
+            torrent_id[:8] if torrent_id else "unknown",
+            file_path,
+            exc,
+        )
         return False

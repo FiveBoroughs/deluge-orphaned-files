@@ -4,7 +4,8 @@ Smoke test for deluge_orphaned_files.logic.autoremove
 
 Creates a temporary SQLite DB with minimal schema and data, mocks a Deluge
 client to simulate cross-seed content groups, and runs process_autoremove_labeling
-in dry-run mode to verify basic flow and stats.
+in both dry-run and live modes to verify cross-seed coordination records pending
+actions for clone torrents.
 """
 
 from __future__ import annotations
@@ -55,7 +56,10 @@ def ensure_tmp_db(db_path: Path, scan_id: int) -> None:
             """,
             ("Movies/Movie.Title.2020/Movie.Title.2020.mkv",),
         )
-        cur.execute("INSERT INTO file_scan_history (file_id, scan_id) VALUES (1, ?);", (scan_id,))
+        cur.execute(
+            "INSERT INTO file_scan_history (file_id, scan_id) VALUES (1, ?);",
+            (scan_id,),
+        )
         conn.commit()
 
 
@@ -98,18 +102,54 @@ def main() -> int:
 
     # Import after env vars set so settings picks them up
     from deluge_orphaned_files.logic.autoremove import process_autoremove_labeling
+    from deluge_orphaned_files.logic.pending_actions import init_pending_actions_schema
 
     db_path = Path(".tmp/smoke.sqlite")
     scan_id = 123
     ensure_tmp_db(db_path, scan_id)
+    init_pending_actions_schema(db_path)
+
+    # Start from a clean slate for pending actions
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DELETE FROM pending_actions;")
+        conn.commit()
 
     client = FakeDelugeClient()
-    stats = process_autoremove_labeling(client=client, scan_id=scan_id, db_path=db_path, dry_run=True, target_label_prefix="autoremove")
+    stats_dry = process_autoremove_labeling(
+        client=client,
+        scan_id=scan_id,
+        db_path=db_path,
+        dry_run=True,
+        target_label_prefix="autoremove",
+    )
 
-    print("SMOKE_STATS:", stats)
-    # Expect at least one content group and cross-seed coordination
-    ok = stats.get("content_groups_found", 0) >= 1 and stats.get("torrents_processed", 0) >= 2
-    return 0 if ok else 1
+    print("SMOKE_STATS_DRY:", stats_dry)
+
+    # Clear pending actions then run a live (non-dry) pass to ensure clones are queued
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DELETE FROM pending_actions;")
+        conn.commit()
+
+    client = FakeDelugeClient()
+    stats_live = process_autoremove_labeling(
+        client=client,
+        scan_id=scan_id,
+        db_path=db_path,
+        dry_run=False,
+        target_label_prefix="autoremove",
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        pending_rows = conn.execute("SELECT torrent_id, file_path FROM pending_actions ORDER BY torrent_id").fetchall()
+
+    print("SMOKE_STATS_LIVE:", stats_live)
+    print("SMOKE_PENDING:", pending_rows)
+
+    # Expect at least one content group and both candidate + clone torrents queued
+    ok_stats = stats_dry.get("content_groups_found", 0) >= 1 and stats_dry.get("torrents_processed", 0) >= 2
+    hashes = {row[0] for row in pending_rows}
+    ok_pending = {"aaaa1111", "bbbb2222"}.issubset(hashes)
+    return 0 if ok_stats and ok_pending else 1
 
 
 if __name__ == "__main__":
