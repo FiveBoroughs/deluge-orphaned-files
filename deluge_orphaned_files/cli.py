@@ -469,6 +469,10 @@ def init_sqlite_cache(db_path: Path) -> None:
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
             logger.debug("Ensuring 'vw_autoremove_candidates_latest_scan' view exists.")
+            logger.debug(
+                "Auto-remove candidates require >= %s consecutive scans before labeling.",
+                config.autoremove_min_consecutive_scans,
+            )
             cursor.execute("DROP VIEW IF EXISTS vw_autoremove_candidates_latest_scan;")
 
             # SQLite doesn't allow parameters in view definitions, so we need to use string formatting
@@ -489,6 +493,7 @@ def init_sqlite_cache(db_path: Path) -> None:
                 sr.id = (SELECT id FROM scan_results ORDER BY created_at DESC LIMIT 1)
                 AND of.source = 'torrents'
                 AND of.status = 'active'
+                AND of.consecutive_scans >= {config.autoremove_min_consecutive_scans}
                 AND of.torrent_id IS NOT NULL
                 AND (
                     of.label IS NULL

@@ -18,7 +18,13 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from loguru import logger
-from pydantic import Field, ValidationError, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = ["AppConfig", "config"]
@@ -80,6 +86,7 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
     deletion_consecutive_scans_threshold: int = Field(default=7, alias="DELETION_CONSECUTIVE_SCANS_THRESHOLD")
     deletion_days_threshold: int = Field(default=7, alias="DELETION_DAYS_THRESHOLD")
     relabel_action_delay_days: int = Field(default=7, alias="RELABEL_ACTION_DELAY_DAYS")
+    autoremove_min_consecutive_scans: int = Field(default=1, alias="AUTOREMOVE_MIN_CONSECUTIVE_SCANS")
 
     # SMTP / e-mail
     smtp_host: Optional[str] = Field(default=None, alias="SMTP_HOST")
@@ -184,6 +191,13 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
         # SMTP recipients
         if self.raw_smtp_to_str:
             self.smtp_to_addrs = [addr.strip() for addr in self.raw_smtp_to_str.split(",") if addr.strip()]
+
+        if self.autoremove_min_consecutive_scans < 1:
+            logger.warning(
+                "AUTOREMOVE_MIN_CONSECUTIVE_SCANS (%s) is less than 1. Clamping to 1.",
+                self.autoremove_min_consecutive_scans,
+            )
+            self.autoremove_min_consecutive_scans = 1
         return self
 
 
