@@ -4,7 +4,7 @@
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Tuple, Optional
 import statistics
 from collections import defaultdict
 
