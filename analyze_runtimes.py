@@ -7,17 +7,18 @@ from pathlib import Path
 from typing import List, Tuple
 import statistics
 
+
 def parse_email_file(filepath: Path) -> Tuple[str, datetime, datetime, float]:
     """Parse an email file and extract scan information."""
-    with open(filepath, 'r') as f:
+    with open(filepath, "r") as f:
         content = f.read()
 
     # Extract date from filename
     filename_date = filepath.name[:8]  # YYYYMMDD
 
     # Extract scan start and end times
-    start_match = re.search(r'Scan Start: (.+)', content)
-    end_match = re.search(r'Scan End: (.+)', content)
+    start_match = re.search(r"Scan Start: (.+)", content)
+    end_match = re.search(r"Scan End: (.+)", content)
 
     if not start_match or not end_match:
         return None
@@ -30,12 +31,13 @@ def parse_email_file(filepath: Path) -> Tuple[str, datetime, datetime, float]:
 
     return filename_date, start_time, end_time, runtime
 
+
 def main():
-    emails_dir = Path('/home/five/Code/deluge-orphaned-files/emails')
+    emails_dir = Path("/home/five/Code/deluge-orphaned-files/emails")
 
     # Parse all email files
     results = []
-    for email_file in sorted(emails_dir.glob('*.txt')):
+    for email_file in sorted(emails_dir.glob("*.txt")):
         try:
             result = parse_email_file(email_file)
             if result:
@@ -59,8 +61,7 @@ def main():
 
     for date, start, end, runtime in results:
         formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
-        print(f"{formatted_date:<12} {start.strftime('%H:%M:%S'):<20} "
-              f"{end.strftime('%H:%M:%S'):<20} {runtime:>14.2f}")
+        print(f"{formatted_date:<12} {start.strftime('%H:%M:%S'):<20} " f"{end.strftime('%H:%M:%S'):<20} {runtime:>14.2f}")
 
     # Calculate statistics
     runtimes = [r[3] for r in results]
@@ -82,11 +83,12 @@ def main():
 
     # Group by week
     from collections import defaultdict
+
     weekly_data = defaultdict(list)
 
     for date, start, end, runtime in results:
         # Parse date string to get week number
-        dt = datetime.strptime(date, '%Y%m%d')
+        dt = datetime.strptime(date, "%Y%m%d")
         week_key = f"{dt.year}-W{dt.isocalendar()[1]:02d}"
         weekly_data[week_key].append(runtime)
 
@@ -134,5 +136,6 @@ def main():
         formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
         print(f"{formatted_date:<12} {runtime:>14.2f} {start.strftime('%H:%M:%S'):<12}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

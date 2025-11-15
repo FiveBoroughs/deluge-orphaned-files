@@ -8,21 +8,22 @@ from typing import List, Tuple, Optional
 import statistics
 from collections import defaultdict
 
+
 def parse_email_file(filepath: Path) -> Optional[Tuple[str, datetime, datetime, float, Optional[str]]]:
     """Parse an email file and extract scan information."""
-    with open(filepath, 'r') as f:
+    with open(filepath, "r") as f:
         content = f.read()
 
     # Extract date from filename
     filename_date = filepath.name[:8]  # YYYYMMDD
 
     # Extract version if present
-    version_match = re.search(r'Version:\s+(.+)', content)
+    version_match = re.search(r"Version:\s+(.+)", content)
     version = version_match.group(1).strip() if version_match else None
 
     # Extract scan start and end times
-    start_match = re.search(r'Scan Start: (.+)', content)
-    end_match = re.search(r'Scan End: (.+)', content)
+    start_match = re.search(r"Scan Start: (.+)", content)
+    end_match = re.search(r"Scan End: (.+)", content)
 
     if not start_match or not end_match:
         return None
@@ -35,12 +36,13 @@ def parse_email_file(filepath: Path) -> Optional[Tuple[str, datetime, datetime, 
 
     return filename_date, start_time, end_time, runtime, version
 
+
 def main():
-    emails_dir = Path('/home/five/Code/deluge-orphaned-files/emails')
+    emails_dir = Path("/home/five/Code/deluge-orphaned-files/emails")
 
     # Parse all email files
     results = []
-    for email_file in sorted(emails_dir.glob('*.txt')):
+    for email_file in sorted(emails_dir.glob("*.txt")):
         try:
             result = parse_email_file(email_file)
             if result:
@@ -65,8 +67,7 @@ def main():
     for date, start, end, runtime, version in results:
         formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
         version_str = version if version else "N/A"
-        print(f"{formatted_date:<12} {version_str:<10} {start.strftime('%H:%M:%S'):<20} "
-              f"{end.strftime('%H:%M:%S'):<20} {runtime:>14.2f}")
+        print(f"{formatted_date:<12} {version_str:<10} {start.strftime('%H:%M:%S'):<20} " f"{end.strftime('%H:%M:%S'):<20} {runtime:>14.2f}")
 
     # Group by version
     print("\n" + "=" * 95)
@@ -159,5 +160,6 @@ def main():
                 increase_pct = ((post_avg - pre_avg) / pre_avg) * 100
                 print(f"⚠️  Runtime INCREASED by {increase_pct:.1f}% after version tracking was added")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
