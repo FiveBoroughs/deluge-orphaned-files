@@ -235,7 +235,7 @@ def load_hashes_from_sqlite(db_path: str | Path, folder_path: Path) -> Dict[str,
             columns = [column[1] for column in cursor.fetchall()]
             has_hash_algorithm = "hash_algorithm" in columns
 
-            logger.trace("Querying SQLite cache for folder: {}", folder_path)
+            logger.info("Querying SQLite cache for folder: {}", folder_path)
 
             # Use different queries based on schema version
             if has_hash_algorithm:
@@ -267,6 +267,7 @@ def load_hashes_from_sqlite(db_path: str | Path, folder_path: Path) -> Dict[str,
                         "size": file_size,
                         "hash_algorithm": hash_algorithm or "md5",  # Default to md5 if NULL for legacy records
                     }
+                logger.info("Loaded {} cache entries for folder: {}", len(cache), folder_path)
             else:
                 # Legacy schema without hash_algorithm column
                 logger.info("Using legacy schema format (without hash_algorithm column)")

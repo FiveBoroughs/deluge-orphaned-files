@@ -246,6 +246,16 @@ def get_local_files(
 
             bar.update(1)
 
+    # Log cache statistics
+    cache_hits = len(paths_with_stats) - new_hashes
+    logger.info(
+        "Cache statistics for {}: {} hits, {} misses, {} total files",
+        folder.name,
+        cache_hits,
+        new_hashes,
+        len(paths_with_stats),
+    )
+
     # Persist cache changes
     if use_sqlite and sqlite_batch:
         try:
