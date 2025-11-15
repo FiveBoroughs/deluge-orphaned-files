@@ -70,9 +70,7 @@ def process_autoremove_labeling(
 
     try:
         # Step 1: Get candidate files for labeling from the database
-        candidate_files = _get_autoremove_candidates(
-            db_path, scan_id, target_label_prefix
-        )
+        candidate_files = _get_autoremove_candidates(db_path, scan_id, target_label_prefix)
 
         if not candidate_files:
             logger.info("No torrents eligible for auto-remove labeling")
@@ -82,9 +80,7 @@ def process_autoremove_labeling(
         all_deluge_torrents = _get_all_deluge_torrents(client)
 
         # Step 3: Group candidates by content paths (cross-seed detection)
-        content_groups = _group_torrents_by_content(
-            candidate_files, all_deluge_torrents
-        )
+        content_groups = _group_torrents_by_content(candidate_files, all_deluge_torrents)
         stats["content_groups_found"] = len(content_groups)
 
         logger.info(
@@ -152,9 +148,7 @@ def process_autoremove_labeling(
     return stats
 
 
-def _get_autoremove_candidates(
-    db_path: Path, scan_id: int, target_label_prefix: str
-) -> List[Dict[str, Any]]:
+def _get_autoremove_candidates(db_path: Path, scan_id: int, target_label_prefix: str) -> List[Dict[str, Any]]:
     """Get candidate files for auto-remove labeling from the database.
 
     Args:
@@ -209,9 +203,7 @@ def _get_autoremove_candidates(
                     }
                 )
 
-        logger.debug(
-            "Found {} candidate files for auto-remove labeling", len(candidates)
-        )
+        logger.debug("Found {} candidate files for auto-remove labeling", len(candidates))
 
     except sqlite3.Error as exc:
         logger.error("Database error getting auto-remove candidates: {}", exc)
@@ -232,9 +224,7 @@ def _get_all_deluge_torrents(client: "DelugeRPCClient") -> Dict[str, Dict[str, A
 
     try:
         # Get all torrents with their info in a single batch call (not N+1 queries)
-        torrents_dict = client.core.get_torrents_status(
-            {}, ["name", "files", "label", "state"]
-        )
+        torrents_dict = client.core.get_torrents_status({}, ["name", "files", "label", "state"])
 
         for torrent_id, torrent_info in torrents_dict.items():
             try:
@@ -247,14 +237,10 @@ def _get_all_deluge_torrents(client: "DelugeRPCClient") -> Dict[str, Dict[str, A
                     }
 
             except Exception as exc:
-                logger.debug(
-                    "Error processing info for torrent {}: {}", torrent_id, exc
-                )
+                logger.debug("Error processing info for torrent {}: {}", torrent_id, exc)
                 continue
 
-        logger.debug(
-            "Retrieved information for {} torrents from Deluge", len(all_torrents)
-        )
+        logger.debug("Retrieved information for {} torrents from Deluge", len(all_torrents))
 
     except Exception as exc:
         logger.error("Error getting torrents from Deluge: {}", exc)
