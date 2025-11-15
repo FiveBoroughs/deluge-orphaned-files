@@ -1,3 +1,3 @@
 """deluge_orphaned_files package initialization."""
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
