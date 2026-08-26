@@ -10,6 +10,8 @@ Returns *lists* ready for DB persistence or e-mail reporting – the caller
 
 from __future__ import annotations
 
+import time
+from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
 from loguru import logger
@@ -18,6 +20,23 @@ from ..deluge.client import get_deluge_files as deluge_get_files
 from ..scanning.file_scanner import get_local_files as scan_get_local_files
 
 __all__: list[str] = ["compute_orphans"]
+
+
+def _clock(ts: float) -> str:
+    """Format a POSIX timestamp as a local wall-clock time for log lines."""
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
+def _duration_human(seconds: float) -> str:
+    """Format an elapsed number of seconds as e.g. '7h06m' or '12m34s'."""
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 
 def _size_human(num_bytes: int) -> str:
@@ -40,6 +59,11 @@ def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool 
     Compares files in the Deluge client, local torrent folders, and media folders
     to identify orphaned or mismatched files in three categories.
 
+    The Deluge file list is a snapshot taken before the (potentially multi-hour)
+    filesystem scan. Files whose mtime is newer than that snapshot are *not* reported
+    as orphans — they may have been added to Deluge while the scan was running — and
+    are deferred to the next run instead.
+
     Args:
         config: The validated AppConfig instance with all required settings.
         skip_media_check: If True, only check torrent-folder orphans and skip
@@ -57,8 +81,11 @@ def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool 
     """
 
     logger.info("Connecting to Deluge and getting file list…")
+    # The snapshot is compared against a filesystem scan that can run for hours; record
+    # when it was taken so files created *after* it are not mistaken for orphans.
+    snapshot_ts = time.time()
     deluge_file_paths, file_labels, file_torrent_ids = deluge_get_files(config)
-    logger.info("Retrieved {} files from Deluge", len(deluge_file_paths))
+    logger.info("Retrieved {} files from Deluge (snapshot taken {})", len(deluge_file_paths), _clock(snapshot_ts))
 
     # Scan torrent folder
     logger.info("Scanning local torrent folder…")
@@ -68,18 +95,52 @@ def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool 
         use_sqlite=use_sqlite,
         no_progress=no_progress,
     )
+    scan_done_ts = time.time()
     logger.info("Found {} files in local torrent folder", len(local_torrent_files))
 
-    orphaned_torrent_files: List[Dict[str, Any]] = [
-        {
-            "path": path,
-            "size": info["size"],
-            "size_human": _size_human(info["size"]),
-        }
-        for path, info in local_torrent_files.items()
-        if path not in deluge_file_paths
-    ]
+    orphaned_torrent_files: List[Dict[str, Any]] = []
+    skipped_newer_than_snapshot = 0
+    for path, info in local_torrent_files.items():
+        if path in deluge_file_paths:
+            continue
+
+        mtime = info.get("mtime")
+        if mtime is not None and mtime >= snapshot_ts:
+            # Created or modified after we asked Deluge what it knew about; its status is
+            # *unknown*, not orphaned. Defer to the next run, which will see it in the snapshot.
+            skipped_newer_than_snapshot += 1
+            logger.info(
+                "skipped-too-new: {} — modified {} after deluge snapshot {} (size {})",
+                path,
+                _clock(mtime),
+                _clock(snapshot_ts),
+                _size_human(info["size"]),
+            )
+            continue
+
+        logger.info(
+            "orphan: {} — not-in-deluge (snapshot {}, file mtime {}, size {})",
+            path,
+            _clock(snapshot_ts),
+            _clock(mtime) if mtime is not None else "unknown",
+            _size_human(info["size"]),
+        )
+        orphaned_torrent_files.append(
+            {
+                "path": path,
+                "size": info["size"],
+                "size_human": _size_human(info["size"]),
+            }
+        )
+
     orphaned_torrent_files.sort(key=lambda x: x["size"], reverse=True)
+    logger.info(
+        "Deluge snapshot taken {}, torrent scan completed {} (age {}), {} files newer than snapshot excluded",
+        _clock(snapshot_ts),
+        _clock(scan_done_ts),
+        _duration_human(scan_done_ts - snapshot_ts),
+        skipped_newer_than_snapshot,
+    )
     logger.info("Torrent-folder orphans: {}", len(orphaned_torrent_files))
 
     if skip_media_check:

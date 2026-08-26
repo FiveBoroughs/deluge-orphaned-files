@@ -18,6 +18,8 @@ from typing import Any, Dict, List
 
 from loguru import logger
 
+from ..settings import config
+
 __all__ = [
     "get_files_to_mark_for_deletion",
     "get_files_to_actually_delete",
@@ -136,10 +138,12 @@ def process_deletions(*, force_delete: bool, db_path: Path, torrent_base_folder:
 
 
 def _delete_marked_files(*, db_path: Path, torrent_base_folder: Path) -> None:
-    """Delete files that are currently active torrent orphans.
+    """Delete torrent orphans that a previous dry run marked for deletion.
 
-    Fetches orphaned files from the database and physically deletes them from disk,
-    then updates their status in the database to 'deleted'.
+    Fetches files whose status is 'marked_for_deletion' and which still satisfy the
+    consecutive-scan threshold, physically deletes them from disk, then updates their
+    status to 'deleted'. Files already gone from disk become 'vanished' instead, so the
+    database keeps the distinction between what this process removed and what did not.
 
     Args:
         db_path: Path to the SQLite database.
@@ -148,24 +152,39 @@ def _delete_marked_files(*, db_path: Path, torrent_base_folder: Path) -> None:
     Raises:
         sqlite3.Error: If there's an error accessing the database.
     """
-    logger.info("Force delete enabled – attempting to delete active torrent orphans.")
+    logger.info("Force delete enabled – deleting torrent orphans marked by a previous dry run.")
 
-    # Fetch active orphaned torrent files
+    scans_threshold = config.deletion_consecutive_scans_threshold
+
+    # Fetch orphaned torrent files the dry run marked, re-checking the threshold here so a
+    # single mis-classification cannot delete a file the first time it is seen.
     files_to_remove: List[Dict[str, Any]] = []
+    marked_total = 0
     try:
         with sqlite3.connect(str(db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, path FROM orphaned_files WHERE source = 'local_torrent_folder' AND status = 'active';",
+                "SELECT id, path, consecutive_scans FROM orphaned_files WHERE source = 'local_torrent_folder' AND status = 'marked_for_deletion';",
             )
             for row in cursor.fetchall():
-                files_to_remove.append({"id": row[0], "path": row[1]})
+                marked_total += 1
+                if row[2] >= scans_threshold:
+                    files_to_remove.append({"id": row[0], "path": row[1]})
     except sqlite3.Error as exc:
-        logger.error("SQLite error fetching active torrent orphans for force deletion: {}", exc)
+        logger.error("SQLite error fetching torrent orphans marked for deletion: {}", exc)
         return
 
+    skipped_below_threshold = marked_total - len(files_to_remove)
+    logger.info(
+        "deletion gate: status=marked_for_deletion, consecutive_scans>={} → {} of {} rows matched ({} skipped-below-threshold)",
+        scans_threshold,
+        len(files_to_remove),
+        marked_total,
+        skipped_below_threshold,
+    )
+
     if not files_to_remove:
-        logger.info("No 'active' orphaned files found to delete.")
+        logger.info("No files marked for deletion passed the deletion gate.")
         return
 
     if not torrent_base_folder.exists() or not torrent_base_folder.is_dir():
@@ -173,6 +192,7 @@ def _delete_marked_files(*, db_path: Path, torrent_base_folder: Path) -> None:
         return
 
     deleted = 0
+    vanished = 0
     with sqlite3.connect(str(db_path)) as conn:
         cursor = conn.cursor()
         for entry in files_to_remove:
@@ -187,11 +207,14 @@ def _delete_marked_files(*, db_path: Path, torrent_base_folder: Path) -> None:
                     os.remove(absolute_path)
                     deleted += 1
                     logger.success("Deleted {}", absolute_path)
+                    new_status = "deleted"
                 else:
-                    logger.warning("File not found while deleting: {}", absolute_path)
+                    logger.warning("File not found while deleting: {} – recording as 'vanished'.", absolute_path)
+                    vanished += 1
+                    new_status = "vanished"
                 cursor.execute(
-                    "UPDATE orphaned_files SET status = 'deleted', deletion_date = CURRENT_TIMESTAMP WHERE id = ?;",
-                    (file_id,),
+                    "UPDATE orphaned_files SET status = ?, deletion_date = CURRENT_TIMESTAMP WHERE id = ?;",
+                    (new_status, file_id),
                 )
                 conn.commit()
             except (PermissionError, OSError) as exc:
@@ -199,7 +222,13 @@ def _delete_marked_files(*, db_path: Path, torrent_base_folder: Path) -> None:
             except sqlite3.Error as exc:
                 logger.error("SQLite update error for file id {}: {}", file_id, exc)
                 conn.rollback()
-    logger.info("Force deletion completed. Deleted {} / {} files.", deleted, len(files_to_remove))
+    logger.info(
+        "Force deletion completed. Attempted {} files → deleted={}, vanished={}, skipped-below-threshold={}.",
+        len(files_to_remove),
+        deleted,
+        vanished,
+        skipped_below_threshold,
+    )
 
 
 def _mark_new_eligible_files(db_path: Path) -> None:

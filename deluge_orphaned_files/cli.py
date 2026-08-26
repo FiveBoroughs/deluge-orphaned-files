@@ -358,7 +358,7 @@ def init_sqlite_cache(db_path: Path) -> None:
                 first_seen_at TIMESTAMP NOT NULL,
                 last_seen_at TIMESTAMP NOT NULL,
                 consecutive_scans INTEGER NOT NULL DEFAULT 1,
-                status TEXT NOT NULL DEFAULT 'active',  -- 'active', 'marked_for_deletion', 'deleted'
+                status TEXT NOT NULL DEFAULT 'active',  -- 'active', 'marked_for_deletion', 'deleted' (removed by us), 'vanished' (gone by other means)
                 deletion_date TIMESTAMP,
                 include_in_report BOOLEAN NOT NULL DEFAULT 1
             );
@@ -1742,41 +1742,59 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
     """
     Processes file deletions based on the force_delete flag.
     If force_delete is False (dry run), identifies eligible files and marks them for deletion.
-    If force_delete is True, deletes files previously marked for deletion.
+    If force_delete is True, deletes files a previous dry run marked for deletion, re-checking
+    the consecutive-scan threshold before acting. Files already gone from disk are recorded as
+    'vanished' rather than 'deleted', so the database keeps attribution.
 
     Args:
         force_delete (bool): If True, perform actual deletions. Otherwise, dry run.
         db_path (Path): Path to the SQLite database.
+        torrent_base_folder (Path): Base directory the stored relative paths resolve against.
     """
     if not db_path.exists():
         logger.warning(f"Deletion processing skipped: Database not found at {db_path}")
         return
 
+    scans_threshold = config.deletion_consecutive_scans_threshold
+
     if force_delete:
-        logger.info("Force delete enabled. Attempting to delete all 'active' orphaned files from 'local_torrent_folder' source immediately.")
+        logger.info("Force delete enabled. Deleting files a previous dry run marked for deletion.")
         files_to_remove_directly = []
+        marked_total = 0
         try:
             with sqlite3.connect(str(db_path)) as conn:
                 cursor = conn.cursor()
+                # Only act on what the dry run marked, and re-check the consecutive-scan
+                # threshold at deletion time, so a single mis-classification cannot delete
+                # a file the very first time it is seen.
                 cursor.execute(
                     """
-                    SELECT id, path
+                    SELECT id, path, consecutive_scans
                     FROM orphaned_files
-                    WHERE source = 'local_torrent_folder' AND status = 'active';
+                    WHERE source = 'local_torrent_folder' AND status = 'marked_for_deletion';
                     """
                 )
                 for row in cursor.fetchall():
-                    files_to_remove_directly.append({"id": row[0], "path": row[1]})
+                    marked_total += 1
+                    if row[2] >= scans_threshold:
+                        files_to_remove_directly.append({"id": row[0], "path": row[1]})
         except sqlite3.Error as e:
-            logger.error(f"SQLite error fetching active torrent orphans for force deletion: {e}")
+            logger.error(f"SQLite error fetching torrent orphans marked for deletion: {e}")
             return  # Can't proceed if we can't fetch
 
+        skipped_below_threshold = marked_total - len(files_to_remove_directly)
+        logger.info(
+            f"deletion gate: status=marked_for_deletion, consecutive_scans>={scans_threshold} → "
+            f"{len(files_to_remove_directly)} of {marked_total} rows matched "
+            f"({skipped_below_threshold} skipped-below-threshold)"
+        )
+
         if not files_to_remove_directly:
-            logger.info("No 'active' orphaned files from 'local_torrent_folder' source found to force delete.")
+            logger.info("No files marked for deletion from 'local_torrent_folder' source passed the deletion gate.")
             return
 
-        logger.info(f"Found {len(files_to_remove_directly)} active torrent orphans for immediate deletion.")
         deleted_count = 0
+        vanished_count = 0
 
         if not torrent_base_folder.exists() or not torrent_base_folder.is_dir():
             logger.error(f"Provided torrent_base_folder '{torrent_base_folder}' does not exist or is not a directory. " f"Cannot proceed with deletions.")
@@ -1804,23 +1822,26 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
                         )
                         deleted_count += 1
                     else:
-                        logger.warning(f"File not found during force delete: {absolute_file_path}. " f"Updating status to 'deleted' as it's gone.")
-                        # Update status even if file not found, as it's effectively gone from orphan perspective
+                        logger.warning(f"File not found during force delete: {absolute_file_path}. " f"Updating status to 'vanished' — this process did not delete it.")
+                        # 'vanished', not 'deleted': something else removed it. Keeping the two
+                        # apart is what lets the DB answer "who deleted this file".
                         cursor.execute(
                             """
                             UPDATE orphaned_files
-                            SET status = 'deleted', deletion_date = CURRENT_TIMESTAMP
-                            WHERE id = ? AND status != 'deleted';
+                            SET status = 'vanished', deletion_date = CURRENT_TIMESTAMP
+                            WHERE id = ? AND status NOT IN ('deleted', 'vanished');
                             """,
                             (file_id,),
                         )
+                        vanished_count += 1
                     conn.commit()
                 except FileNotFoundError:  # Should be caught by .exists(), but as a fallback
-                    logger.warning(f"File not found (caught by except FileNotFoundError) during force delete: {absolute_file_path}. Updating status to 'deleted'.")
+                    logger.warning(f"File not found (caught by except FileNotFoundError) during force delete: {absolute_file_path}. Updating status to 'vanished'.")
                     cursor.execute(
-                        "UPDATE orphaned_files SET status = 'deleted', deletion_date = CURRENT_TIMESTAMP WHERE id = ? AND status != 'deleted';",
+                        "UPDATE orphaned_files SET status = 'vanished', deletion_date = CURRENT_TIMESTAMP WHERE id = ? AND status NOT IN ('deleted', 'vanished');",
                         (file_id,),
                     )
+                    vanished_count += 1
                     conn.commit()
                 except PermissionError:
                     logger.error(f"Permission denied. Cannot force delete file: {absolute_file_path}")
@@ -1829,7 +1850,12 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
                 except sqlite3.Error as e:
                     logger.error(f"SQLite error updating status for file ID {file_id} ({absolute_file_path}) after force delete attempt: {e}")
                     conn.rollback()
-        logger.info(f"Force deletion process completed. Attempted to delete {len(files_to_remove_directly)} files, successfully deleted {deleted_count}.")
+        logger.info(
+            f"Force deletion process completed. Attempted {len(files_to_remove_directly)} files → "
+            f"deleted={deleted_count}, vanished={vanished_count}, "
+            f"skipped-below-threshold={skipped_below_threshold}, "
+            f"failed={len(files_to_remove_directly) - deleted_count - vanished_count}."
+        )
     else:
         logger.info("Dry run for deletions. Identifying files eligible for deletion and marking them...")
         files_to_mark = get_files_to_mark_for_deletion(db_path)
@@ -2103,6 +2129,15 @@ def main() -> None:
             format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
         )
         logger.trace("Trace logging enabled.")
+
+    # Record the flags and thresholds in effect so a log file read months later is
+    # self-describing and does not require guessing how the run was invoked.
+    logger.info("Flags in effect: {}", " ".join(f"--{name.replace('_', '-')}={value}" for name, value in sorted(vars(args).items())))
+    logger.info(
+        "Deletion thresholds in effect: DELETION_CONSECUTIVE_SCANS_THRESHOLD={}, DELETION_DAYS_THRESHOLD={}",
+        config.deletion_consecutive_scans_threshold,
+        config.deletion_days_threshold,
+    )
 
     if args.sqlite:
         logger.debug(f"Initializing SQLite database schema at {config.sqlite_cache_path}")

@@ -170,7 +170,7 @@ def get_local_files(
 
     Returns:
         Dictionary where keys are relative file paths and values are
-        dictionaries containing 'hash' and 'size' fields.
+        dictionaries containing 'hash', 'size', 'hash_algorithm' and 'mtime' fields.
 
     Raises:
         FileNotFoundError: If files disappear during scanning.
@@ -242,7 +242,9 @@ def get_local_files(
                 if use_sqlite:
                     sqlite_batch.append((file_hash, str(folder), rel_path, mtime, st.st_size, hash_algorithm))
 
-            local_files[rel_path] = {"hash": file_hash, "size": st.st_size, "hash_algorithm": hash_algorithm}
+            # mtime is retained so callers can tell whether a file appeared *after* a given
+            # point in time (e.g. the Deluge snapshot that orphan detection compares against).
+            local_files[rel_path] = {"hash": file_hash, "size": st.st_size, "hash_algorithm": hash_algorithm, "mtime": mtime}
 
             bar.update(1)
 
