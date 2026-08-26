@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from loguru import logger
@@ -39,6 +40,31 @@ def _duration_human(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _blacklisted_subfolder(path: str, blacklist: List[str]) -> str | None:
+    """Return the blacklisted top-level subfolder owning *path*, or None.
+
+    Matches both the subfolder itself (``cg/…``) and unpackerr's temp directory for it
+    (``cg_unpackerred/…``). The plain ``sub + "/"`` test used for the hash comparisons
+    misses the latter, which is how 59 hand-managed ``cg_unpackerred/`` files became
+    deletion candidates.
+    """
+    for sub in blacklist:
+        if path.startswith(sub + "/") or path.startswith(sub + "_unpackerred/"):
+            return sub
+    return None
+
+
+def _is_partial_file(path: str) -> bool:
+    """True for Deluge in-progress allocations and hidden files.
+
+    Deleting a ``.parts`` file out from under an active download corrupts it, so these are
+    never orphan candidates — matched by pattern rather than via ``EXTENSIONS_BLACKLIST``
+    so that no configuration change can turn them back into candidates.
+    """
+    name = Path(path).name
+    return name.startswith(".") or name.endswith(".parts")
+
+
 def _size_human(num_bytes: int) -> str:
     """Convert byte size to human readable format.
 
@@ -62,7 +88,8 @@ def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool 
     The Deluge file list is a snapshot taken before the (potentially multi-hour)
     filesystem scan. Files whose mtime is newer than that snapshot are *not* reported
     as orphans — they may have been added to Deluge while the scan was running — and
-    are deferred to the next run instead.
+    are deferred to the next run instead. Files under a blacklisted subfolder (or its
+    ``_unpackerred`` temp directory) and Deluge partial allocations are excluded outright.
 
     Args:
         config: The validated AppConfig instance with all required settings.
@@ -100,8 +127,21 @@ def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool 
 
     orphaned_torrent_files: List[Dict[str, Any]] = []
     skipped_newer_than_snapshot = 0
+    skipped_blacklisted = 0
+    skipped_partial = 0
     for path, info in local_torrent_files.items():
         if path in deluge_file_paths:
+            continue
+
+        blacklisted_subfolder = _blacklisted_subfolder(path, config.local_subfolders_blacklist)
+        if blacklisted_subfolder is not None:
+            skipped_blacklisted += 1
+            logger.info("skipped-blacklisted: {} — subfolder '{}' excluded", path, blacklisted_subfolder)
+            continue
+
+        if _is_partial_file(path):
+            skipped_partial += 1
+            logger.info("skipped-partial: {} — Deluge partial/hidden file", path)
             continue
 
         mtime = info.get("mtime")
@@ -140,6 +180,12 @@ def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool 
         _clock(scan_done_ts),
         _duration_human(scan_done_ts - snapshot_ts),
         skipped_newer_than_snapshot,
+    )
+    logger.info(
+        "Orphan candidates dropped: skipped-too-new={}, skipped-blacklisted={}, skipped-partial={}",
+        skipped_newer_than_snapshot,
+        skipped_blacklisted,
+        skipped_partial,
     )
     logger.info("Torrent-folder orphans: {}", len(orphaned_torrent_files))
 

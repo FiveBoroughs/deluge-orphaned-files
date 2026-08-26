@@ -25,7 +25,9 @@ def config() -> SimpleNamespace:
     return SimpleNamespace(
         local_torrent_base_local_folder=Path("/torrents"),
         local_media_base_local_folder=Path("/media"),
-        local_subfolders_blacklist=[],
+        # Mirrors the deployed LOCAL_SUBFOLDERS_BLACKLIST. Note 'tv' is absent: Sonarr
+        # consumes tv_unpackerred/, so those stay deletion candidates.
+        local_subfolders_blacklist=["music", "cg", "courses", "ebooks", "soft", "comics"],
     )
 
 
@@ -112,6 +114,55 @@ def test_files_known_to_deluge_are_never_orphans(monkeypatch, config):
     orphans, _, _ = orphan_finder.compute_orphans(config=config, skip_media_check=True)
 
     assert orphans == []
+
+
+def test_blacklisted_subfolder_and_its_unpackerred_dir_are_excluded(monkeypatch, config):
+    """`cg` has no arr consuming it, so cg_unpackerred/ is hand-managed and must be kept."""
+    now = time.time()
+    _patch(
+        monkeypatch,
+        deluge_paths=set(),
+        local_files={
+            "cg/artbook.cbz": _entry(mtime=now - HOUR),
+            "cg_unpackerred/artbook.cbz": _entry(mtime=now - HOUR),
+            "soft_unpackerred/installer.iso": _entry(mtime=now - HOUR),
+        },
+    )
+
+    orphans, _, _ = orphan_finder.compute_orphans(config=config, skip_media_check=True)
+
+    assert orphans == []
+
+
+def test_unpackerred_dir_without_a_blacklisted_parent_stays_a_candidate(monkeypatch, config):
+    """tv_unpackerred/ is Sonarr's import staging — transient, so still a candidate."""
+    _patch(
+        monkeypatch,
+        deluge_paths=set(),
+        local_files={"tv_unpackerred/Silo S03E08.mkv": _entry(mtime=time.time() - HOUR)},
+    )
+
+    orphans, _, _ = orphan_finder.compute_orphans(config=config, skip_media_check=True)
+
+    assert [o["path"] for o in orphans] == ["tv_unpackerred/Silo S03E08.mkv"]
+
+
+def test_deluge_partial_allocations_are_never_candidates(monkeypatch, config):
+    """Deleting a .parts file under an active download corrupts it."""
+    now = time.time()
+    _patch(
+        monkeypatch,
+        deluge_paths=set(),
+        local_files={
+            "cross-seed-links/Show.S01E01.mkv.parts": _entry(mtime=now - HOUR),
+            "cross-seed-links/.hidden-scratch": _entry(mtime=now - HOUR),
+            "cross-seed-links/Genuine Leftover.mkv": _entry(size=4096, mtime=now - HOUR),
+        },
+    )
+
+    orphans, _, _ = orphan_finder.compute_orphans(config=config, skip_media_check=True)
+
+    assert [o["path"] for o in orphans] == ["cross-seed-links/Genuine Leftover.mkv"]
 
 
 def test_scanner_reports_mtime(tmp_path):
