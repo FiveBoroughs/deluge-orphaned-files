@@ -25,7 +25,9 @@ jobs:
       - name: Install dependencies & dev tools
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt black flake8 pytest
+          # Black is pinned below 26: the 26.0 stable style collapses `f("""…""")` call
+          # wrapping, which reformats six files this repo formatted under 25.x.
+          pip install -r requirements.txt "black<26" flake8 pytest
 
       - name: Black format check (line length 200)
         run: black --check --line-length 200 .
