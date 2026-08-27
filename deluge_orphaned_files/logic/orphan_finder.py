@@ -71,46 +71,30 @@ def _is_partial_file(path: str) -> bool:
     return name.startswith(".") or name.endswith(".parts")
 
 
-def _assert_hardlinks_work(dir1: Path, dir2: Path) -> None:
-    """Verify hardlinks can be created between dir1 and dir2.
+def _assert_same_filesystem(dir1: Path, dir2: Path) -> int:
+    """Verify dir1 and dir2 are on the same filesystem and return its st_dev.
 
-    Creates a temporary file in dir1, hardlinks it into dir2, confirms the two names
-    resolve to the same (st_dev, st_ino) — the key the inode scanners compare on —
-    then cleans up. Raises InodePreflightError with a diagnostic message on any failure.
+    Inode comparison identifies files by (st_dev, st_ino), which is only meaningful
+    when both trees share one filesystem. Checked via stat rather than by creating a
+    probe hardlink: link(2) fails with EXDEV across two bind mounts even when both
+    expose the same filesystem (exactly the Docker deployment, where /data/torrents
+    and /data/media are sibling bind mounts of one dataset) — and stat needs no write
+    access to either tree.
     """
-    import errno
-    import uuid
-
-    tag = uuid.uuid4().hex
-    src = Path(dir1) / f".inode_probe_{tag}"
-    dst = Path(dir2) / f".inode_probe_{tag}"
     try:
-        try:
-            src.touch()
-        except OSError as exc:
-            raise InodePreflightError(f"--use-inodes: cannot create probe file in {dir1} ({exc}). The torrent directory must be writable for the hardlink check.") from exc
-        try:
-            os.link(src, dst)
-        except OSError as exc:
-            if exc.errno == errno.EXDEV:
-                remedy = "Mount both directories under a single parent bind mount, or use hash mode (default)."
-            elif exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM):
-                remedy = f"The media directory must allow creating the probe hardlink; {dir2} appears read-only or permission-restricted."
-            elif exc.errno == errno.ENOENT:
-                remedy = f"{dir2} does not exist or is not mounted."
-            else:
-                remedy = f"Unexpected error (errno {exc.errno})."
-            raise InodePreflightError(f"--use-inodes: cannot create hardlink between\n  {dir1}\n  {dir2}\n  ({exc})\n{remedy}") from exc
-        st_src = os.stat(src)
-        st_dst = os.stat(dst)
-        if not os.path.samestat(st_src, st_dst):
-            raise InodePreflightError(
-                f"--use-inodes: hardlink succeeded but the two names resolve to different files "
-                f"(dev/ino {st_src.st_dev}/{st_src.st_ino} vs {st_dst.st_dev}/{st_dst.st_ino}). Inode comparison unreliable on this mount."
-            )
-    finally:
-        src.unlink(missing_ok=True)
-        dst.unlink(missing_ok=True)
+        st1 = os.stat(dir1)
+    except OSError as exc:
+        raise InodePreflightError(f"--use-inodes: cannot stat {dir1} ({exc}). Is the torrent directory mounted?") from exc
+    try:
+        st2 = os.stat(dir2)
+    except OSError as exc:
+        raise InodePreflightError(f"--use-inodes: cannot stat {dir2} ({exc}). Is the media directory mounted?") from exc
+    if st1.st_dev != st2.st_dev:
+        raise InodePreflightError(
+            f"--use-inodes: {dir1} (device {st1.st_dev}) and {dir2} (device {st2.st_dev}) are on different filesystems; "
+            "files can never share an inode across them. Use hash mode (default), or mount both from the same filesystem."
+        )
+    return st1.st_dev
 
 
 def _torrent_sort_key(entry: Dict[str, Any]) -> Tuple[str, int]:
@@ -181,7 +165,7 @@ def compute_orphans(
     if use_inodes and not skip_media_check:
         # Fail fast, before the potentially multi-hour scans, if the mount layout
         # cannot support inode comparison between the two folders.
-        _assert_hardlinks_work(
+        shared_dev = _assert_same_filesystem(
             Path(config.local_torrent_base_local_folder),
             Path(config.local_media_base_local_folder),
         )
@@ -303,6 +287,13 @@ def compute_orphans(
         for name, info in local_media_files.items():
             if _blacklisted_subfolder(name, blacklist) is None:
                 media_inode_map.setdefault(info["inode"], []).append((name, info["size"]))
+
+        # A file on a nested mount inside either tree has a different st_dev than the
+        # roots the preflight validated, so it can never match by inode — surface that
+        # instead of silently reporting the whole nested subtree as orphaned.
+        foreign = sum(1 for inode in torrent_inode_map if inode[0] != shared_dev) + sum(1 for inode in media_inode_map if inode[0] != shared_dev)
+        if foreign:
+            logger.warning("{} files sit on a different filesystem than the scan roots (nested mount?) and can never match by inode", foreign)
 
         only_in_torrents: List[Dict[str, Any]] = [_torrent_entry(*min(entries), file_labels, file_torrent_ids) for inode, entries in torrent_inode_map.items() if inode not in media_inode_map]
         only_in_media: List[Dict[str, Any]] = [_media_entry(*min(entries)) for inode, entries in media_inode_map.items() if inode not in torrent_inode_map]

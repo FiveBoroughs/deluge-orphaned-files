@@ -2023,7 +2023,7 @@ def main() -> None:
         help=(
             "Compare files by inode (st_dev, st_ino) instead of content hash. "
             "Much faster — no hashing needed. Requires the torrent and media "
-            "directories to be on the same device (same bind mount). "
+            "directories to be on the same filesystem. "
             "Hardlinked names are collapsed to one entry per physical file."
         ),
     )
@@ -2241,7 +2241,7 @@ def main() -> None:
             use_inodes=args.use_inodes,
         )
     except InodePreflightError as exc:
-        # The --use-inodes hardlink preflight carries its own remediation message;
+        # The --use-inodes same-filesystem preflight carries its own remediation message;
         # exit cleanly instead of dumping a traceback.
         logger.error("{}", exc)
         sys.exit(1)

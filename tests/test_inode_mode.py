@@ -1,4 +1,4 @@
-"""Tests for --use-inodes mode: the hardlink preflight, scanner parity with hash mode,
+"""Tests for --use-inodes mode: the same-filesystem preflight, scanner parity with hash mode,
 and the inode-based torrent/media comparison.
 
 The preflight must fail *before* any scan (the walks can run for hours) and must fail
@@ -8,7 +8,6 @@ into a clean error message and nonzero exit.
 
 from __future__ import annotations
 
-import errno
 import os
 import time
 from types import SimpleNamespace
@@ -42,9 +41,9 @@ def test_hardlink_preflight_runs_before_deluge_and_scans(monkeypatch, config):
         raise ValueError("boom")
 
     def too_late(*args, **kwargs):
-        raise AssertionError("Deluge/scan ran before the hardlink preflight")
+        raise AssertionError("Deluge/scan ran before the same-filesystem preflight")
 
-    monkeypatch.setattr(orphan_finder, "_assert_hardlinks_work", failing_check)
+    monkeypatch.setattr(orphan_finder, "_assert_same_filesystem", failing_check)
     monkeypatch.setattr(orphan_finder, "deluge_get_files", too_late)
     monkeypatch.setattr(orphan_finder, "scan_get_local_files_inodes", too_late)
 
@@ -52,47 +51,32 @@ def test_hardlink_preflight_runs_before_deluge_and_scans(monkeypatch, config):
         orphan_finder.compute_orphans(config=config, use_inodes=True)
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
-def test_probe_in_readonly_dir_raises_the_diagnostic_error(tmp_path):
-    """A read-only torrent mount must produce the remediation message, not a PermissionError."""
-    src_dir = tmp_path / "torrents"
-    dst_dir = tmp_path / "media"
-    src_dir.mkdir()
-    dst_dir.mkdir()
-    src_dir.chmod(0o555)
-    try:
-        with pytest.raises(orphan_finder.InodePreflightError, match="cannot create probe file"):
-            orphan_finder._assert_hardlinks_work(src_dir, dst_dir)
-    finally:
-        src_dir.chmod(0o755)
+def test_preflight_passes_on_same_filesystem_and_needs_no_write_access(tmp_path):
+    """The stat-based check must work on read-only mounts and create no files.
 
-
-@pytest.mark.parametrize(
-    ("err", "match"),
-    [
-        (errno.EXDEV, "single parent bind mount"),
-        (errno.EACCES, "read-only or permission-restricted"),
-        (errno.ENOENT, "does not exist or is not mounted"),
-    ],
-)
-def test_link_failures_get_errno_specific_remediation(tmp_path, monkeypatch, err, match):
-    """EXDEV means cross-device; other errnos must not get the 'bind mount' advice."""
+    A probe hardlink is the wrong test: link(2) fails with EXDEV across two bind
+    mounts of the same filesystem (the Docker deployment), where inode comparison
+    is perfectly valid.
+    """
     a = tmp_path / "a"
     b = tmp_path / "b"
     a.mkdir()
     b.mkdir()
+    a.chmod(0o555)
+    b.chmod(0o555)
+    try:
+        shared_dev = orphan_finder._assert_same_filesystem(a, b)
+    finally:
+        a.chmod(0o755)
+        b.chmod(0o755)
 
-    def failing_link(src, dst, **kwargs):
-        raise OSError(err, os.strerror(err))
-
-    monkeypatch.setattr(orphan_finder.os, "link", failing_link)
-
-    with pytest.raises(orphan_finder.InodePreflightError, match=match):
-        orphan_finder._assert_hardlinks_work(a, b)
+    assert shared_dev == os.stat(a).st_dev
+    assert list(a.iterdir()) == []
+    assert list(b.iterdir()) == []
 
 
-def test_probe_detects_differing_devices_behind_matching_inodes(tmp_path, monkeypatch):
-    """The scanners key on (st_dev, st_ino); equal st_ino alone must not pass the probe."""
+def test_preflight_rejects_roots_on_different_filesystems(tmp_path, monkeypatch):
+    """The scanners key on (st_dev, st_ino); differing root devices must fail fast."""
     a = tmp_path / "a"
     b = tmp_path / "b"
     a.mkdir()
@@ -116,20 +100,16 @@ def test_probe_detects_differing_devices_behind_matching_inodes(tmp_path, monkey
 
     monkeypatch.setattr(orphan_finder.os, "stat", fake_stat)
 
-    with pytest.raises(orphan_finder.InodePreflightError, match="resolve to different files"):
-        orphan_finder._assert_hardlinks_work(a, b)
+    with pytest.raises(orphan_finder.InodePreflightError, match="different filesystems"):
+        orphan_finder._assert_same_filesystem(a, b)
 
 
-def test_hardlink_probe_passes_on_same_filesystem_and_cleans_up(tmp_path):
+def test_preflight_reports_an_unmounted_directory(tmp_path):
     a = tmp_path / "a"
-    b = tmp_path / "b"
     a.mkdir()
-    b.mkdir()
 
-    orphan_finder._assert_hardlinks_work(a, b)
-
-    assert list(a.iterdir()) == []
-    assert list(b.iterdir()) == []
+    with pytest.raises(orphan_finder.InodePreflightError, match="Is the media directory mounted"):
+        orphan_finder._assert_same_filesystem(a, tmp_path / "missing")
 
 
 def test_inode_mode_pairs_hardlinks_and_respects_blacklist(monkeypatch, config):
