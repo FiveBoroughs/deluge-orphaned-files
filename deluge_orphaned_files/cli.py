@@ -38,7 +38,7 @@ from .database.hash_cache import (  # noqa: F401 – some imports are kept for b
     load_hashes_from_sqlite as db_load_hashes_from_sqlite,
     upsert_hash_to_sqlite as db_upsert_hash_to_sqlite,
 )
-from .logic.orphan_finder import compute_orphans
+from .logic.orphan_finder import InodePreflightError, compute_orphans
 from .logic.autoremove import process_autoremove_labeling
 from .logic.pending_actions import (
     init_pending_actions_schema,
@@ -846,7 +846,7 @@ def get_local_files(folder: str, use_sqlite: bool = False, no_progress: bool = F
     return local_files
 
 
-def find_orphaned_files(skip_media_check: bool = False, use_sqlite: bool = False, no_progress: bool = False) -> int:
+def find_orphaned_files(skip_media_check: bool = False, use_sqlite: bool = False, no_progress: bool = False, use_inodes: bool = False) -> int:
     """Find orphaned files by comparing Deluge files with local torrent and media folders.
 
     Scans local folders and Deluge client to identify orphaned files in three categories:
@@ -875,6 +875,7 @@ def find_orphaned_files(skip_media_check: bool = False, use_sqlite: bool = False
         skip_media_check=skip_media_check,
         use_sqlite=use_sqlite,
         no_progress=no_progress,
+        use_inodes=use_inodes,
     )
 
     logger.info(
@@ -1042,13 +1043,15 @@ def save_scan_results_to_db(
                 existing_consecutive_scans = existing_record[1]
 
                 # File exists, update it
-                # Also update file_hash, size, size_human if they might have changed for the same path
+                # Also update file_hash, size, size_human if they might have changed for the same path.
+                # An empty resolved hash (e.g. an inode-mode scan, which does no hashing) must not
+                # overwrite a hash stored by an earlier hash-mode run.
                 cursor.execute(
                     """
                 UPDATE orphaned_files
                 SET last_seen_at = ?,
                     consecutive_scans = consecutive_scans + 1,
-                    file_hash = ?,
+                    file_hash = COALESCE(NULLIF(?, ''), file_hash),
                     size = ?,
                     size_human = ?,
                     include_in_report = ?,
@@ -1146,7 +1149,7 @@ def save_scan_results_to_db(
                 UPDATE orphaned_files
                 SET last_seen_at = ?,
                     consecutive_scans = consecutive_scans + 1,
-                    file_hash = ?,
+                    file_hash = COALESCE(NULLIF(?, ''), file_hash),
                     label = ?,
                     size = ?,
                     size_human = ?,
@@ -1236,7 +1239,7 @@ def save_scan_results_to_db(
                 UPDATE orphaned_files
                 SET last_seen_at = ?,
                     consecutive_scans = consecutive_scans + 1,
-                    file_hash = ?,
+                    file_hash = COALESCE(NULLIF(?, ''), file_hash),
                     label = ?,
                     size = ?,
                     size_human = ?,
@@ -2013,6 +2016,17 @@ def main() -> None:
         action="store_true",
         help="Disable progress bars during scan operations",
     )
+    scan_group.add_argument(
+        "--use-inodes",
+        action="store_true",
+        default=False,
+        help=(
+            "Compare files by inode (st_dev, st_ino) instead of content hash. "
+            "Much faster — no hashing needed. Requires the torrent and media "
+            "directories to be on the same device (same bind mount). "
+            "Hardlinked names are collapsed to one entry per physical file."
+        ),
+    )
 
     # Storage options group
     storage_group = parser.add_argument_group("Storage Options")
@@ -2219,11 +2233,18 @@ def main() -> None:
         return
 
     # Run the scan using the storage mode chosen by the user (--sqlite flag)
-    scan_id = find_orphaned_files(
-        skip_media_check=args.skip_media_check,
-        use_sqlite=args.sqlite,
-        no_progress=args.no_progress,
-    )
+    try:
+        scan_id = find_orphaned_files(
+            skip_media_check=args.skip_media_check,
+            use_sqlite=args.sqlite,
+            no_progress=args.no_progress,
+            use_inodes=args.use_inodes,
+        )
+    except InodePreflightError as exc:
+        # The --use-inodes hardlink preflight carries its own remediation message;
+        # exit cleanly instead of dumping a traceback.
+        logger.error("{}", exc)
+        sys.exit(1)
 
     # Handle auto-remove labels or pending actions if requested
     if args.apply_autoremove_labels:

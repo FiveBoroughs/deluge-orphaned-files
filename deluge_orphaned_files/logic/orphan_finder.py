@@ -10,6 +10,7 @@ Returns *lists* ready for DB persistence or e-mail reporting – the caller
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,8 +20,13 @@ from loguru import logger
 
 from ..deluge.client import get_deluge_files as deluge_get_files
 from ..scanning.file_scanner import get_local_files as scan_get_local_files
+from ..scanning.file_scanner import get_local_files_inodes as scan_get_local_files_inodes
 
-__all__: list[str] = ["compute_orphans"]
+__all__: list[str] = ["compute_orphans", "InodePreflightError"]
+
+
+class InodePreflightError(ValueError):
+    """--use-inodes preflight failure; the message carries user-facing remediation."""
 
 
 def _clock(ts: float) -> str:
@@ -65,6 +71,67 @@ def _is_partial_file(path: str) -> bool:
     return name.startswith(".") or name.endswith(".parts")
 
 
+def _assert_hardlinks_work(dir1: Path, dir2: Path) -> None:
+    """Verify hardlinks can be created between dir1 and dir2.
+
+    Creates a temporary file in dir1, hardlinks it into dir2, confirms the two names
+    resolve to the same (st_dev, st_ino) — the key the inode scanners compare on —
+    then cleans up. Raises InodePreflightError with a diagnostic message on any failure.
+    """
+    import errno
+    import uuid
+
+    tag = uuid.uuid4().hex
+    src = Path(dir1) / f".inode_probe_{tag}"
+    dst = Path(dir2) / f".inode_probe_{tag}"
+    try:
+        try:
+            src.touch()
+        except OSError as exc:
+            raise InodePreflightError(f"--use-inodes: cannot create probe file in {dir1} ({exc}). The torrent directory must be writable for the hardlink check.") from exc
+        try:
+            os.link(src, dst)
+        except OSError as exc:
+            if exc.errno == errno.EXDEV:
+                remedy = "Mount both directories under a single parent bind mount, or use hash mode (default)."
+            elif exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM):
+                remedy = f"The media directory must allow creating the probe hardlink; {dir2} appears read-only or permission-restricted."
+            elif exc.errno == errno.ENOENT:
+                remedy = f"{dir2} does not exist or is not mounted."
+            else:
+                remedy = f"Unexpected error (errno {exc.errno})."
+            raise InodePreflightError(f"--use-inodes: cannot create hardlink between\n  {dir1}\n  {dir2}\n  ({exc})\n{remedy}") from exc
+        st_src = os.stat(src)
+        st_dst = os.stat(dst)
+        if not os.path.samestat(st_src, st_dst):
+            raise InodePreflightError(
+                f"--use-inodes: hardlink succeeded but the two names resolve to different files "
+                f"(dev/ino {st_src.st_dev}/{st_src.st_ino} vs {st_dst.st_dev}/{st_dst.st_ino}). Inode comparison unreliable on this mount."
+            )
+    finally:
+        src.unlink(missing_ok=True)
+        dst.unlink(missing_ok=True)
+
+
+def _torrent_sort_key(entry: Dict[str, Any]) -> Tuple[str, int]:
+    """Sort key for only-in-torrents entries: 'other*' labels trail real labels, then by size."""
+    return ("a" if entry["label"].startswith("other") else entry["label"], entry["size"])
+
+
+def _torrent_entry(name: str, size: int, file_labels: Dict[str, str], file_torrent_ids: Dict[str, str]) -> Dict[str, Any]:
+    return {
+        "path": name,
+        "label": file_labels.get(name, "none"),
+        "size": size,
+        "size_human": _size_human(size),
+        "torrent_id": file_torrent_ids.get(name, None),
+    }
+
+
+def _media_entry(name: str, size: int) -> Dict[str, Any]:
+    return {"path": name, "size": size, "size_human": _size_human(size)}
+
+
 def _size_human(num_bytes: int) -> str:
     """Convert byte size to human readable format.
 
@@ -79,7 +146,9 @@ def _size_human(num_bytes: int) -> str:
     return f"{num_bytes / (1024**2):.2f} MB"
 
 
-def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool = False, no_progress: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+def compute_orphans(
+    *, config, skip_media_check: bool = False, use_sqlite: bool = False, no_progress: bool = False, use_inodes: bool = False
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Calculate orphaned files across torrent and media folders.
 
     Compares files in the Deluge client, local torrent folders, and media folders
@@ -97,6 +166,8 @@ def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool 
             the media folder scan completely.
         use_sqlite: Whether to use SQLite for hash caching instead of JSON files.
         no_progress: Whether to disable progress bars for file scanning.
+        use_inodes: If True, compare by (st_dev, st_ino) instead of content hash.
+            Much faster but requires both directories to be on the same filesystem.
 
     Returns:
         A tuple containing three lists:
@@ -107,6 +178,14 @@ def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool 
         Each list contains dictionaries with file details (path, size, etc.).
     """
 
+    if use_inodes and not skip_media_check:
+        # Fail fast, before the potentially multi-hour scans, if the mount layout
+        # cannot support inode comparison between the two folders.
+        _assert_hardlinks_work(
+            Path(config.local_torrent_base_local_folder),
+            Path(config.local_media_base_local_folder),
+        )
+
     logger.info("Connecting to Deluge and getting file list…")
     # The snapshot is compared against a filesystem scan that can run for hours; record
     # when it was taken so files created *after* it are not mistaken for orphans.
@@ -116,12 +195,19 @@ def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool 
 
     # Scan torrent folder
     logger.info("Scanning local torrent folder…")
-    local_torrent_files = scan_get_local_files(
-        folder=config.local_torrent_base_local_folder,
-        config=config,
-        use_sqlite=use_sqlite,
-        no_progress=no_progress,
-    )
+    if use_inodes:
+        local_torrent_files = scan_get_local_files_inodes(
+            folder=config.local_torrent_base_local_folder,
+            config=config,
+            no_progress=no_progress,
+        )
+    else:
+        local_torrent_files = scan_get_local_files(
+            folder=config.local_torrent_base_local_folder,
+            config=config,
+            use_sqlite=use_sqlite,
+            no_progress=no_progress,
+        )
     scan_done_ts = time.time()
     logger.info("Found {} files in local torrent folder", len(local_torrent_files))
 
@@ -192,60 +278,54 @@ def compute_orphans(*, config, skip_media_check: bool = False, use_sqlite: bool 
     if skip_media_check:
         return orphaned_torrent_files, [], []
 
-    # Scan media folder
-    logger.info("Scanning local media folder…")
-    local_media_files = scan_get_local_files(
-        folder=config.local_media_base_local_folder,
-        config=config,
-        use_sqlite=use_sqlite,
-        no_progress=no_progress,
-    )
-    logger.info("Found {} files in local media folder", len(local_media_files))
+    blacklist = config.local_subfolders_blacklist
 
-    # Hash dictionaries with blacklist filtering
-    torrent_hashes: Dict[str, Tuple[str, int, str, str]] = {
-        info["hash"]: (
-            name,
-            info["size"],
-            file_labels.get(name, "none"),
-            file_torrent_ids.get(name, None),
+    if use_inodes:
+        # Scan media folder
+        logger.info("Scanning local media folder (inode mode)…")
+        local_media_files = scan_get_local_files_inodes(
+            folder=config.local_media_base_local_folder,
+            config=config,
+            no_progress=no_progress,
         )
-        for name, info in local_torrent_files.items()
-        if not any(name.startswith(sub + "/") for sub in config.local_subfolders_blacklist)
-    }
-    media_hashes: Dict[str, Tuple[str, int]] = {
-        info["hash"]: (name, info["size"]) for name, info in local_media_files.items() if not any(name.startswith(sub + "/") for sub in config.local_subfolders_blacklist)
-    }
+        logger.info("Found {} files in local media folder", len(local_media_files))
 
-    torrent_set = frozenset(torrent_hashes.keys())
-    media_set = frozenset(media_hashes.keys())
+        # Group by inode — several names can hardlink to the same physical file. Like
+        # hash mode, each physical file is reported once: under its lexicographically
+        # smallest name, so the representative (and the DB row accruing
+        # consecutive_scans) stays stable across scans.
+        torrent_inode_map: Dict[tuple, List[tuple]] = {}
+        for name, info in local_torrent_files.items():
+            if _blacklisted_subfolder(name, blacklist) is None:
+                torrent_inode_map.setdefault(info["inode"], []).append((name, info["size"]))
 
-    only_in_torrents: List[Dict[str, Any]] = [
-        {
-            "path": torrent_hashes[h][0],
-            "label": torrent_hashes[h][2],
-            "size": torrent_hashes[h][1],
-            "size_human": _size_human(torrent_hashes[h][1]),
-            "torrent_id": torrent_hashes[h][3],
-        }
-        for h in torrent_set - media_set
-    ]
-    only_in_torrents.sort(
-        key=lambda x: (
-            "a" if x["label"].startswith("other") else x["label"],
-            x["size"],
-        ),
-        reverse=True,
-    )
+        media_inode_map: Dict[tuple, List[tuple]] = {}
+        for name, info in local_media_files.items():
+            if _blacklisted_subfolder(name, blacklist) is None:
+                media_inode_map.setdefault(info["inode"], []).append((name, info["size"]))
 
-    only_in_media: List[Dict[str, Any]] = [
-        {
-            "path": media_hashes[h][0],
-            "size": media_hashes[h][1],
-            "size_human": _size_human(media_hashes[h][1]),
-        }
-        for h in media_set - torrent_set
-    ]
+        only_in_torrents: List[Dict[str, Any]] = [_torrent_entry(*min(entries), file_labels, file_torrent_ids) for inode, entries in torrent_inode_map.items() if inode not in media_inode_map]
+        only_in_media: List[Dict[str, Any]] = [_media_entry(*min(entries)) for inode, entries in media_inode_map.items() if inode not in torrent_inode_map]
+
+    else:
+        # Scan media folder
+        logger.info("Scanning local media folder…")
+        local_media_files = scan_get_local_files(
+            folder=config.local_media_base_local_folder,
+            config=config,
+            use_sqlite=use_sqlite,
+            no_progress=no_progress,
+        )
+        logger.info("Found {} files in local media folder", len(local_media_files))
+
+        # Keyed by hash: duplicate content collapses to a single representative path.
+        torrent_hashes: Dict[str, Tuple[str, int]] = {info["hash"]: (name, info["size"]) for name, info in local_torrent_files.items() if _blacklisted_subfolder(name, blacklist) is None}
+        media_hashes: Dict[str, Tuple[str, int]] = {info["hash"]: (name, info["size"]) for name, info in local_media_files.items() if _blacklisted_subfolder(name, blacklist) is None}
+
+        only_in_torrents = [_torrent_entry(name, size, file_labels, file_torrent_ids) for name, size in (torrent_hashes[h] for h in torrent_hashes.keys() - media_hashes.keys())]
+        only_in_media = [_media_entry(name, size) for name, size in (media_hashes[h] for h in media_hashes.keys() - torrent_hashes.keys())]
+
+    only_in_torrents.sort(key=_torrent_sort_key, reverse=True)
     only_in_media.sort(key=lambda x: x["size"], reverse=True)
 
     logger.info("Files only in torrents: {}, only in media: {}", len(only_in_torrents), len(only_in_media))

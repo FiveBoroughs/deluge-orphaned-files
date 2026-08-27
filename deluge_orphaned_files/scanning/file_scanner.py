@@ -40,6 +40,7 @@ __all__ = [
     "load_hashes_from_sqlite",
     "save_hash_cache",
     "get_local_files",
+    "get_local_files_inodes",
 ]
 
 
@@ -151,6 +152,36 @@ def _upsert_hash_to_sqlite(
     )
 
 
+def _gather_eligible_files(folder: Path, config: AppConfigLike) -> list[tuple[str, os.stat_result]]:
+    """Walk *folder* and return (path, stat) pairs for files passing should_process_file().
+
+    Prunes blacklisted top-level subfolders and follows symlinks, so hash mode and
+    inode mode see the identical set of files.
+    """
+    paths_with_stats: list[tuple[str, os.stat_result]] = []
+    for root, dirs, files in os.walk(folder):
+        current_path = Path(root)
+        rel_root = current_path.relative_to(folder)
+
+        # Skip blacklisted top-level subfolders only (matches previous behaviour)
+        if rel_root.parts and rel_root.parts[0] in config.local_subfolders_blacklist:  # type: ignore[attr-defined]
+            logger.trace("Skipping blacklisted directory {}", rel_root.parts[0])
+            dirs[:] = []
+            continue
+
+        for filename in files:
+            full_path = current_path / filename
+            try:
+                st = full_path.stat()
+                if should_process_file(full_path, st, config):
+                    paths_with_stats.append((str(full_path), st))
+            except FileNotFoundError:
+                logger.warning("File disappeared during scan: {}", full_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Error stating file {}: {}", full_path, exc)
+    return paths_with_stats
+
+
 def get_local_files(
     folder: Path | str,
     config: AppConfigLike,
@@ -188,27 +219,7 @@ def get_local_files(
         hash_cache = load_hash_cache(cache_file)
 
     # Phase 1 – gather eligible files quickly (single stat per file)
-    paths_with_stats: list[tuple[str, os.stat_result]] = []
-    for root, dirs, files in os.walk(folder):
-        current_path = Path(root)
-        rel_root = current_path.relative_to(folder)
-
-        # Skip blacklisted top-level subfolders only (matches previous behaviour)
-        if rel_root.parts and rel_root.parts[0] in config.local_subfolders_blacklist:  # type: ignore[attr-defined]
-            logger.trace("Skipping blacklisted directory {}", rel_root.parts[0])
-            dirs[:] = []
-            continue
-
-        for filename in files:
-            full_path = current_path / filename
-            try:
-                st = full_path.stat()
-                if should_process_file(full_path, st, config):
-                    paths_with_stats.append((str(full_path), st))
-            except FileNotFoundError:
-                logger.warning("File disappeared during scan: {}", full_path)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Error stating file {}: {}", full_path, exc)
+    paths_with_stats = _gather_eligible_files(folder, config)
 
     # Phase 2 – process eligible files
     new_hashes = 0
@@ -275,4 +286,25 @@ def get_local_files(
 
     logger.info("Finished scanning {}: {} new hashes ({} files total)", folder.name, new_hashes, len(local_files))
 
+    return local_files
+
+
+def get_local_files_inodes(
+    folder: Path | str,
+    config: AppConfigLike,
+    no_progress: bool = False,
+) -> dict[str, dict[str, object]]:
+    """Walk folder and return {relative_path: {"inode": (dev, ino), "size": bytes, "mtime": ts}}.
+
+    No hashing or caching. Uses the same walk and should_process_file() filtering as
+    get_local_files() (symlinks followed, blacklists and min_file_size_mb respected),
+    so both modes see the identical set of files.
+    """
+    folder = Path(folder)
+
+    local_files: dict[str, dict[str, object]] = {
+        os.path.relpath(full_path_str, folder): {"inode": (st.st_dev, st.st_ino), "size": st.st_size, "mtime": st.st_mtime} for full_path_str, st in _gather_eligible_files(folder, config)
+    }
+
+    logger.info("Finished inode scan of {}: {} files", folder.name, len(local_files))
     return local_files
