@@ -133,7 +133,8 @@ def _send_in_chunks(*, bot_token: str, chat_id: str, title: str, content: str, c
     if not success:
         return False
 
-    # Send remaining chunks, paced to stay under Telegram's per-chat rate limit
+    # Send remaining chunks, paced to stay under Telegram's per-chat rate limit and
+    # silent so a multi-chunk report triggers a single notification, not one per chunk.
     for i, chunk in enumerate(chunks[1:], 1):
         time.sleep(SECONDS_BETWEEN_CHUNKS)
         cont_message = f"<pre>{chunk}</pre>"
@@ -142,6 +143,7 @@ def _send_in_chunks(*, bot_token: str, chat_id: str, title: str, content: str, c
             "text": cont_message,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
+            "disable_notification": True,
         }
         if not _do_request(bot_token, "sendMessage", cont_payload):
             logger.error(f"Failed to send chunk {i+1}/{len(chunks)}")

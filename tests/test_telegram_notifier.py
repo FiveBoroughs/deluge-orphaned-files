@@ -67,6 +67,9 @@ def test_chunks_are_paced_and_all_sent(monkeypatch, no_sleep):
     assert len(sent) > 2
     # One pacing sleep per chunk after the first
     assert no_sleep.count(telegram_notifier.SECONDS_BETWEEN_CHUNKS) == len(sent) - 1
+    # Only the first chunk notifies; the rest are silent
+    assert "disable_notification" not in sent[0]
+    assert all(p.get("disable_notification") is True for p in sent[1:])
 
 
 def test_entity_expansion_cannot_exceed_telegram_limit(monkeypatch):
