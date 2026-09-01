@@ -11,6 +11,7 @@ Usage is similar to :pymod:`emailer`; errors are logged, not raised.
 from __future__ import annotations
 
 import html
+import time
 import requests
 from typing import Dict, Any
 from loguru import logger
@@ -19,9 +20,14 @@ __all__: list[str] = ["send_scan_report"]
 
 API_BASE_URL = "https://api.telegram.org/bot{token}/{method}"
 
+# Telegram allows bots ~20 messages/minute to the same chat; long reports span
+# dozens of chunks, so pace sends instead of relying on 429 retries alone.
+SECONDS_BETWEEN_CHUNKS = 3.0
+MAX_ATTEMPTS_PER_MESSAGE = 4
+
 
 def _do_request(token: str, method: str, payload: Dict[str, Any]) -> bool:
-    """Make a request to the Telegram API.
+    """Make a request to the Telegram API, honouring 429 rate-limit backoff.
 
     Args:
         token: Telegram bot token.
@@ -32,18 +38,32 @@ def _do_request(token: str, method: str, payload: Dict[str, Any]) -> bool:
         bool: True if the request was successful, False otherwise.
     """
     url = API_BASE_URL.format(token=token, method=method)
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("ok"):
-            logger.error("Telegram API responded with ok=false: {}", data)
+    for attempt in range(1, MAX_ATTEMPTS_PER_MESSAGE + 1):
+        try:
+            response = requests.post(url, json=payload, timeout=10)
+            if response.status_code == 429:
+                # Telegram tells us exactly how long to wait; fall back to 30s if absent.
+                try:
+                    retry_after = int(response.json().get("parameters", {}).get("retry_after", 30))
+                except (ValueError, requests.RequestException):
+                    retry_after = 30
+                if attempt < MAX_ATTEMPTS_PER_MESSAGE:
+                    logger.warning("Telegram rate limit hit (429); waiting {}s before retry {}/{}", retry_after, attempt + 1, MAX_ATTEMPTS_PER_MESSAGE)
+                    time.sleep(retry_after + 1)
+                    continue
+                logger.error("Telegram rate limit hit (429) and retries exhausted")
+                return False
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("ok"):
+                logger.error("Telegram API responded with ok=false: {}", data)
+                return False
+            logger.info("Telegram message sent successfully (chat_id={})", payload.get("chat_id"))
+            return True
+        except requests.RequestException as exc:  # noqa: BLE001
+            logger.error("Failed to send Telegram message: {}", exc)
             return False
-        logger.info("Telegram message sent successfully (chat_id={})", payload.get("chat_id"))
-        return True
-    except requests.RequestException as exc:  # noqa: BLE001
-        logger.error("Failed to send Telegram message: {}", exc)
-        return False
+    return False
 
 
 def _send_in_chunks(*, bot_token: str, chat_id: str, title: str, content: str, chunk_size: int = 3800) -> bool:
@@ -59,7 +79,9 @@ def _send_in_chunks(*, bot_token: str, chat_id: str, title: str, content: str, c
     Returns:
         bool: True if all chunks were sent successfully, False otherwise.
     """
-    lines = content.split("\n")
+    # Escape BEFORE chunking: entity expansion ('&' -> '&amp;') otherwise pushes an
+    # already-full chunk past Telegram's 4096-character message limit.
+    lines = html.escape(content).split("\n")
     chunks = []
     current_chunk = []
     current_length = 0
@@ -99,8 +121,8 @@ def _send_in_chunks(*, bot_token: str, chat_id: str, title: str, content: str, c
         logger.warning("No content to send via Telegram")
         return False
 
-    # Send first chunk with title
-    first_message = f"<b>{html.escape(title)}</b>\n\n<pre>{html.escape(chunks[0])}</pre>"
+    # Send first chunk with title (content is already escaped above)
+    first_message = f"<b>{html.escape(title)}</b>\n\n<pre>{chunks[0]}</pre>"
     first_payload = {
         "chat_id": chat_id,
         "text": first_message,
@@ -111,9 +133,10 @@ def _send_in_chunks(*, bot_token: str, chat_id: str, title: str, content: str, c
     if not success:
         return False
 
-    # Send remaining chunks
+    # Send remaining chunks, paced to stay under Telegram's per-chat rate limit
     for i, chunk in enumerate(chunks[1:], 1):
-        cont_message = f"<pre>{html.escape(chunk)}</pre>"
+        time.sleep(SECONDS_BETWEEN_CHUNKS)
+        cont_message = f"<pre>{chunk}</pre>"
         cont_payload = {
             "chat_id": chat_id,
             "text": cont_message,
