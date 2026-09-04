@@ -195,6 +195,24 @@ def compute_orphans(
     scan_done_ts = time.time()
     logger.info("Found {} files in local torrent folder", len(local_torrent_files))
 
+    # Refresh Deluge after the filesystem walk. cross-seed can create a hardlink and
+    # inject its torrent while a scan is running; hardlink creation preserves the
+    # underlying file's old mtime, so the timestamp guard below cannot identify that
+    # new directory entry. Union both snapshots: additions during the scan become
+    # known, while removals during the scan are conservatively deferred until next time.
+    logger.info("Refreshing Deluge file list after torrent-folder scan…")
+    refreshed_paths, refreshed_labels, refreshed_torrent_ids = deluge_get_files(config)
+    paths_added_during_scan = refreshed_paths - deluge_file_paths
+    deluge_file_paths.update(refreshed_paths)
+    file_labels.update(refreshed_labels)
+    file_torrent_ids.update(refreshed_torrent_ids)
+    logger.info(
+        "Post-scan Deluge refresh found {} files ({} added since initial snapshot); comparing against {} unique owned paths",
+        len(refreshed_paths),
+        len(paths_added_during_scan),
+        len(deluge_file_paths),
+    )
+
     orphaned_torrent_files: List[Dict[str, Any]] = []
     skipped_newer_than_snapshot = 0
     skipped_blacklisted = 0

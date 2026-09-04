@@ -26,6 +26,36 @@ SECONDS_BETWEEN_CHUNKS = 3.0
 MAX_ATTEMPTS_PER_MESSAGE = 4
 
 
+def _escape_and_chunk(content: str, chunk_size: int) -> list[str]:
+    """Escape plain text into independently valid HTML chunks.
+
+    Budget by escaped length while consuming one source character at a time. This
+    prevents slicing inside entities such as ``&amp;`` while keeping every encoded
+    chunk within Telegram's payload limit.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_length = 0
+
+    for character in content:
+        escaped = html.escape(character)
+        if len(escaped) > chunk_size:
+            raise ValueError("chunk_size is too small for an escaped character")
+        if current and current_length + len(escaped) > chunk_size:
+            chunks.append("".join(current))
+            current = []
+            current_length = 0
+        current.append(escaped)
+        current_length += len(escaped)
+
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 def _do_request(token: str, method: str, payload: Dict[str, Any]) -> bool:
     """Make a request to the Telegram API, honouring 429 rate-limit backoff.
 
@@ -61,7 +91,14 @@ def _do_request(token: str, method: str, payload: Dict[str, Any]) -> bool:
             logger.info("Telegram message sent successfully (chat_id={})", payload.get("chat_id"))
             return True
         except requests.RequestException as exc:  # noqa: BLE001
-            logger.error("Failed to send Telegram message: {}", exc)
+            # requests' exception text includes the request URL, which embeds the bot
+            # token. Retain actionable diagnostics without writing credentials to logs.
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            diagnostic = type(exc).__name__
+            if status_code is not None:
+                diagnostic += f" (HTTP {status_code})"
+            logger.error("Failed to send Telegram message via {}: {}", method, diagnostic)
             return False
     return False
 
@@ -79,43 +116,7 @@ def _send_in_chunks(*, bot_token: str, chat_id: str, title: str, content: str, c
     Returns:
         bool: True if all chunks were sent successfully, False otherwise.
     """
-    # Escape BEFORE chunking: entity expansion ('&' -> '&amp;') otherwise pushes an
-    # already-full chunk past Telegram's 4096-character message limit.
-    lines = html.escape(content).split("\n")
-    chunks = []
-    current_chunk = []
-    current_length = 0
-
-    # Process lines into chunks
-    for line in lines:
-        line_length = len(line) + 1  # +1 for newline
-
-        # Handle lines longer than chunk_size
-        if line_length > chunk_size:
-            # If we have accumulated content already, save it as a chunk first
-            if current_chunk:
-                chunks.append("\n".join(current_chunk))
-                current_chunk = []
-                current_length = 0
-
-            # Split long line into sub-chunks
-            for i in range(0, len(line), chunk_size):
-                sub_chunk = line[i : i + chunk_size]  # noqa: E203
-                # Each sub-chunk becomes its own complete chunk
-                chunks.append(sub_chunk)
-        # Normal case - line fits within chunk_size
-        else:
-            # Start a new chunk if adding this line would exceed chunk_size
-            if current_length + line_length > chunk_size:
-                chunks.append("\n".join(current_chunk))
-                current_chunk = []
-                current_length = 0
-
-            current_chunk.append(line)
-            current_length += line_length
-
-    if current_chunk:
-        chunks.append("\n".join(current_chunk))
+    chunks = _escape_and_chunk(content, chunk_size)
 
     if not chunks:
         logger.warning("No content to send via Telegram")

@@ -57,6 +57,27 @@ def test_file_created_after_snapshot_is_not_an_orphan(monkeypatch, config):
     assert orphans == []
 
 
+def test_second_deluge_snapshot_protects_old_mtime_hardlink_injected_during_scan(monkeypatch, config):
+    """Hardlink creation preserves mtime, so ownership—not timestamps—must close the race."""
+    path = "cross-seed-links/Tracker/injected-old-release.mkv"
+    snapshots = iter(
+        [
+            (set(), {}, {}),
+            ({path}, {path: "moviecat.cross-seed"}, {path: "torrent-id"}),
+        ]
+    )
+    monkeypatch.setattr(orphan_finder, "deluge_get_files", lambda config: next(snapshots))
+    monkeypatch.setattr(
+        orphan_finder,
+        "scan_get_local_files",
+        lambda **kwargs: {path: _entry(mtime=time.time() - HOUR)},
+    )
+
+    orphans, _, _ = orphan_finder.compute_orphans(config=config, skip_media_check=True)
+
+    assert orphans == []
+
+
 def test_file_older_than_snapshot_is_an_orphan(monkeypatch, config):
     """A genuine leftover — on disk before we asked Deluge, and still unknown to it."""
     _patch(

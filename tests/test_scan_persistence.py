@@ -58,6 +58,14 @@ def _stored(db_path, path, source):
         ).fetchone()
 
 
+def _stored_retention_state(db_path, path):
+    with sqlite3.connect(str(db_path)) as conn:
+        return conn.execute(
+            "SELECT status, consecutive_scans FROM orphaned_files WHERE path = ? AND source = 'local_torrent_folder'",
+            (path,),
+        ).fetchone()
+
+
 def _set_cached_hash(db_path, folder, rel_path, file_hash):
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute("DELETE FROM file_hashes WHERE folder_path = ? AND relative_path = ?", (str(folder), rel_path))
@@ -115,3 +123,47 @@ def test_hash_preserved_for_orphan_and_media_sources_too(cli, tmp_path, monkeypa
 
     assert _stored(db_path, "orphan.mkv", "local_torrent_folder") == ("aaaa1111", 2)
     assert _stored(db_path, "media.mkv", "media") == ("bbbb2222", 2)
+
+
+def test_scan_preserves_current_deletion_marks_and_clears_stale_ones(cli, tmp_path, monkeypatch):
+    """A force scan must delete only a previously marked file that is still orphaned.
+
+    A marked row that remains in the current orphan set must keep its mark. A marked row
+    absent from the current set (for example because Deluge reacquired it) must become
+    inactive before the deletion gate runs.
+    """
+    db_path = tmp_path / "retention-state.db"
+    monkeypatch.setattr(cli.config, "sqlite_cache_path", db_path)
+    cli.init_sqlite_cache(db_path)
+
+    current = {"path": "current-orphan.mkv", "size": 1, "size_human": "0.00 MB"}
+    reacquired = {"path": "reacquired-by-deluge.mkv", "size": 1, "size_human": "0.00 MB"}
+
+    cli.save_scan_results_to_db([current, reacquired], [], [], datetime.now())
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("UPDATE orphaned_files SET status = 'marked_for_deletion' WHERE source = 'local_torrent_folder'")
+
+    # The next scan still considers one path orphaned; the other is no longer an orphan.
+    cli.save_scan_results_to_db([current], [], [], datetime.now())
+
+    assert _stored_retention_state(db_path, "current-orphan.mkv") == ("marked_for_deletion", 2)
+    assert _stored_retention_state(db_path, "reacquired-by-deluge.mkv") == ("inactive", 0)
+
+
+def test_force_deletion_cycle_deletes_old_marks_then_marks_current_candidates(cli, tmp_path, monkeypatch):
+    """The always-force production schedule must still prepare work for its next run."""
+    calls = []
+
+    def record_call(*, force_delete, db_path, torrent_base_folder):
+        calls.append((force_delete, db_path, torrent_base_folder))
+
+    monkeypatch.setattr(cli, "process_deletions", record_call)
+
+    db_path = tmp_path / "cycle.db"
+    torrent_base = tmp_path / "torrents"
+    cli._process_deletion_cycle(force_delete=True, db_path=db_path, torrent_base_folder=torrent_base)
+
+    assert calls == [
+        (True, db_path, torrent_base),
+        (False, db_path, torrent_base),
+    ]

@@ -7,6 +7,8 @@ chunk past the 4096-character message limit.
 
 from __future__ import annotations
 
+import html
+
 import pytest
 
 from deluge_orphaned_files.notifications import telegram_notifier
@@ -87,3 +89,41 @@ def test_entity_expansion_cannot_exceed_telegram_limit(monkeypatch):
     assert telegram_notifier._send_in_chunks(bot_token="tok", chat_id="1", title="T", content=content) is True
     for payload in sent:
         assert len(payload["text"]) <= 4096
+
+
+def test_chunk_boundary_never_splits_an_html_entity(monkeypatch):
+    sent: list[dict] = []
+
+    def fake_post(url, json=None, timeout=None):
+        sent.append(json)
+        return _FakeResponse(200)
+
+    monkeypatch.setattr(telegram_notifier.requests, "post", fake_post)
+    monkeypatch.setattr(telegram_notifier.time, "sleep", lambda seconds: None)
+
+    # Escaping appends "&amp;" after 3,799 characters, exactly across the old
+    # 3,800-character slicing boundary.
+    content = "x" * 3799 + "&"
+    assert telegram_notifier._send_in_chunks(bot_token="tok", chat_id="1", title="T", content=content) is True
+
+    bodies = [payload["text"].split("<pre>", 1)[1].rsplit("</pre>", 1)[0] for payload in sent]
+    assert "".join(html.unescape(body) for body in bodies) == content
+
+
+def test_request_errors_never_log_the_bot_token(monkeypatch):
+    secret = "secret-bot-token"
+    messages: list[str] = []
+
+    def fail(*args, **kwargs):
+        raise telegram_notifier.requests.ConnectionError(f"request failed for https://api.telegram.org/bot{secret}/sendMessage")
+
+    monkeypatch.setattr(telegram_notifier.requests, "post", fail)
+    sink = telegram_notifier.logger.add(messages.append, format="{message}")
+    try:
+        assert telegram_notifier._do_request(secret, "sendMessage", {"chat_id": "1", "text": "x"}) is False
+    finally:
+        telegram_notifier.logger.remove(sink)
+
+    logged = "".join(messages)
+    assert secret not in logged
+    assert "ConnectionError" in logged

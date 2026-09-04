@@ -945,17 +945,20 @@ def save_scan_results_to_db(
             scan_id = cursor.lastrowid
             logger.info(f"Created scan record with ID {scan_id}")
 
-        # Mark 'local_torrent_folder' files not found in this scan as inactive
+        # Mark tracked 'local_torrent_folder' files not found in this scan as inactive.
+        # Include rows already marked for deletion: if Deluge has reacquired the path (or
+        # it otherwise stopped being an orphan), the mark must be cleared before the
+        # force-deletion gate runs later in this invocation.
         current_source_for_orphans = "local_torrent_folder"
         cursor.execute(
             """
             SELECT id, path FROM orphaned_files
-            WHERE source = ? AND status = 'active'
+            WHERE source = ? AND status IN ('active', 'marked_for_deletion')
             """,
             (current_source_for_orphans,),
         )
 
-        active_db_orphan_files = {row[1]: row[0] for row in cursor.fetchall()}  # path: id
+        tracked_db_orphan_files = {row[1]: row[0] for row in cursor.fetchall()}  # path: id
 
         current_disk_orphan_files_paths = set()
         for file_info_ot_pre_check in orphaned_torrent_files:
@@ -963,7 +966,7 @@ def save_scan_results_to_db(
             current_disk_orphan_files_paths.add(path_ot_pre_check)
 
         orphans_no_longer_seen_ids = []
-        for db_path, db_file_id in active_db_orphan_files.items():
+        for db_path, db_file_id in tracked_db_orphan_files.items():
             if db_path not in current_disk_orphan_files_paths:
                 orphans_no_longer_seen_ids.append(db_file_id)
 
@@ -980,7 +983,7 @@ def save_scan_results_to_db(
                 tuple(orphans_no_longer_seen_ids) + (current_source_for_orphans,),
             )
             logger.info(
-                f"Marked {len(orphans_no_longer_seen_ids)} previously active '{current_source_for_orphans}' files "
+                f"Marked {len(orphans_no_longer_seen_ids)} previously tracked '{current_source_for_orphans}' files "
                 f"as 'inactive' (consecutive scans reset) because they were not found in scan ID {scan_id}."
             )
 
@@ -1031,7 +1034,7 @@ def save_scan_results_to_db(
             # Check if this orphaned file (by path and source) already exists
             cursor.execute(
                 """
-            SELECT id, consecutive_scans FROM orphaned_files
+            SELECT id, consecutive_scans, status FROM orphaned_files
             WHERE path = ? AND source = ?
             """,
                 (path, current_source),
@@ -1041,11 +1044,14 @@ def save_scan_results_to_db(
             if existing_record:
                 file_id = existing_record[0]
                 existing_consecutive_scans = existing_record[1]
+                existing_status = existing_record[2]
 
                 # File exists, update it
                 # Also update file_hash, size, size_human if they might have changed for the same path.
                 # An empty resolved hash (e.g. an inode-mode scan, which does no hashing) must not
                 # overwrite a hash stored by an earlier hash-mode run.
+                # Preserve a previous deletion mark while the path remains a current orphan. The
+                # force-deletion pass relies on that mark; all other rediscovered states reactivate.
                 cursor.execute(
                     """
                 UPDATE orphaned_files
@@ -1055,7 +1061,10 @@ def save_scan_results_to_db(
                     size = ?,
                     size_human = ?,
                     include_in_report = ?,
-                    status = 'active',  -- Ensure it's marked active if seen again
+                    status = CASE
+                        WHEN status = 'marked_for_deletion' THEN status
+                        ELSE 'active'
+                    END,
                     torrent_id = COALESCE(torrent_id, ?) -- Populate torrent_id if NULL
                 WHERE id = ?
                 """,
@@ -1070,10 +1079,11 @@ def save_scan_results_to_db(
                     ),
                 )
                 updated_consecutive_scans = existing_consecutive_scans + 1
+                updated_status = "marked_for_deletion" if existing_status == "marked_for_deletion" else "active"
                 logger.debug(
                     (
                         f"Updated existing orphaned file: ID {file_id}, Path {path}, Source {current_source}. "
-                        f"Consecutive_scans: {existing_consecutive_scans} -> {updated_consecutive_scans}. Status set to 'active'."
+                        f"Consecutive_scans: {existing_consecutive_scans} -> {updated_consecutive_scans}. Status set to '{updated_status}'."
                     )
                 )
             else:
@@ -1891,6 +1901,27 @@ def process_deletions(force_delete: bool, db_path: Path, torrent_base_folder: Pa
         logger.info(f"Marked {len(files_to_mark)} files for deletion. Run with --force to actually delete them.")
 
 
+def _process_deletion_cycle(*, force_delete: bool, db_path: Path, torrent_base_folder: Path) -> None:
+    """Run deletion in two phases so an always-force schedule keeps advancing.
+
+    A force run first deletes rows marked by a previous scan. It then performs the
+    non-destructive marking pass so files eligible in the current scan are staged for
+    revalidation and possible deletion on the next run.
+    """
+    process_deletions(
+        force_delete=force_delete,
+        db_path=db_path,
+        torrent_base_folder=torrent_base_folder,
+    )
+    if force_delete:
+        logger.info("Preparing currently eligible orphan files for validation on the next force run...")
+        process_deletions(
+            force_delete=False,
+            db_path=db_path,
+            torrent_base_folder=torrent_base_folder,
+        )
+
+
 # Old process_autoremove_labeling function removed - now using modular version from logic/autoremove.py
 
 
@@ -2311,7 +2342,7 @@ def main() -> None:
             logger.info(f"To view these results later, use: --scan-id {scan_id} --sqlite")
 
         logger.info(f"Processing potential deletions (Force mode: {args.force})...")
-        process_deletions(
+        _process_deletion_cycle(
             force_delete=args.force,
             db_path=config.sqlite_cache_path,
             torrent_base_folder=config.local_torrent_base_local_folder,
