@@ -24,11 +24,11 @@ COPY deluge_orphaned_files ./deluge_orphaned_files
 COPY *.py ./
 
 ARG VERSION=dev
+ARG REVISION=unknown
 LABEL org.opencontainers.image.title="deluge-orphaned-files" \
       org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.description="Utility to manage orphaned files between Deluge torrents and media library." \
-      org.opencontainers.image.source="https://github.com/your-org/deluge-orphaned-files"
-
-EXPOSE 8000
+      org.opencontainers.image.source="https://github.com/FiveBoroughs/deluge-orphaned-files"
 
 ENTRYPOINT ["python", "-m", "deluge_orphaned_files.cli"]

@@ -77,6 +77,9 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            VERSION=${{ github.sha }}
+            REVISION=${{ github.sha }}
           tags: |
             ghcr.io/${{ steps.repo.outputs.owner_lc }}/deluge-orphaned-files:latest
             ghcr.io/${{ steps.repo.outputs.owner_lc }}/deluge-orphaned-files:${{ github.sha }}
