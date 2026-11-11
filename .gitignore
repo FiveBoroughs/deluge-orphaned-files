@@ -34,3 +34,14 @@ Thumbs.db
 
 # Ignore local temp artifacts
 .tmp/
+
+# Ignore local agent/tool state
+.claude/
+.scratch/
+
+# Local-only ops material (LAN details / credentials; never commit)
+HANDOFF-*.md
+get_paused_torrents.py
+
+# Generated report files
+DelugeOrphanedFilesReport*.md
