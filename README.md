@@ -169,6 +169,31 @@ Available options:
 - `--debug`: Enable detailed debug logging
 - `--skip-media-check`: Skip media folder comparison
 
+### Scheduled mode (internal cron)
+
+The Docker entrypoint is a small scheduler (`deluge_orphaned_files/scheduler.py`) that dispatches to the CLI:
+
+- **`CRON_SCHEDULE` unset** — one-shot: the CLI runs once with the container arguments and the container exits, exactly as before.
+- **`CRON_SCHEDULE` set** — daemon: the container stays running and executes the CLI once per cron fire. Arguments are still supplied as the container command.
+
+| Variable | Meaning |
+|---|---|
+| `CRON_SCHEDULE` | 5-field cron expression (`minute hour day month weekday`), evaluated in container local time (`TZ`). Empty/unset disables daemon mode. |
+| `RUN_ON_STARTUP` | `true` (default) also runs once immediately at container start; `false` waits for the first scheduled fire. |
+
+```bash
+docker run -d --restart unless-stopped \
+  -e CRON_SCHEDULE="0 2 * * *" \
+  -e TZ=Europe/Paris \
+  ... (Deluge/path env as above) ... \
+  ghcr.io/fiveboroughs/deluge-orphaned-files:latest \
+  --sqlite --no-progress --use-inodes --apply-autoremove-labels --execute-pending-actions --force
+```
+
+Runs never overlap; a run that overruns its slot skips the missed fire rather than queueing a catch-up. A failed run is logged and the schedule continues. `docker stop` is handled cleanly (SIGTERM is forwarded to a running scan). A heartbeat file backs the image HEALTHCHECK while idling.
+
+**Migrating from an external cron/start-on-schedule setup** (e.g. TrueNAS cron job starting the container): set `CRON_SCHEDULE`, change the app restart policy to *unless-stopped*, and remove the external cron job.
+
 ## Output Format
 
 The script generates a JSON file with the following structure:

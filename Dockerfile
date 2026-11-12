@@ -31,4 +31,11 @@ LABEL org.opencontainers.image.title="deluge-orphaned-files" \
       org.opencontainers.image.description="Utility to manage orphaned files between Deluge torrents and media library." \
       org.opencontainers.image.source="https://github.com/FiveBoroughs/deluge-orphaned-files"
 
-ENTRYPOINT ["python", "-m", "deluge_orphaned_files.cli"]
+# Healthy = scheduler heartbeat fresh (<180s). A missing heartbeat file means
+# one-shot mode (no CRON_SCHEDULE), where there is nothing idle to supervise.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
+    CMD ["python", "-c", "import os,sys,time; p='/tmp/delugeof-heartbeat'; sys.exit(0 if not os.path.exists(p) or time.time()-os.path.getmtime(p) < 180 else 1)"]
+
+# Scheduler dispatches to the CLI: one-shot exec when CRON_SCHEDULE is unset,
+# internal cron loop when it is set. Container CMD remains the CLI arguments.
+ENTRYPOINT ["python", "-m", "deluge_orphaned_files.scheduler"]
