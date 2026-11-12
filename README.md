@@ -194,6 +194,19 @@ Runs never overlap; a run that overruns its slot skips the missed fire rather th
 
 **Migrating from an external cron/start-on-schedule setup** (e.g. TrueNAS cron job starting the container): set `CRON_SCHEDULE`, change the app restart policy to *unless-stopped*, and remove the external cron job.
 
+### Repairing stuck cross-seed torrents
+
+cross-seed injects partial matches paused and only resumes them when little is missing, so some torrents sit paused-incomplete forever even though every missing file already exists on disk, verified complete in another torrent. Two standalone flags (no scan) find and fix those:
+
+```bash
+python -m deluge_orphaned_files.cli --repair-stuck-torrents   # dry-run: log planned hardlinks
+python -m deluge_orphaned_files.cli --apply-stuck-repairs     # link, guarded recheck, resume what verifies
+```
+
+Eligible torrents are paused, incomplete, labelled `cross-seed` or `*.cross-seed`, and added more than `REPAIR_MIN_AGE_HOURS` (24) ago. Each missing wanted file is matched to a verified donor by name+size — or by size alone when at least `REPAIR_SIZE_ONLY_MIN_MB` (50 MB) and unambiguous — then hardlinked into place. Destinations another torrent also uses are skipped, directories are never created, existing partials are kept as `*.delugeof-repair-bak` until verification passes, and repairs are all-or-nothing per torrent.
+
+The verification recheck runs with all file priorities at 0, a `REPAIR_MAX_DOWNLOAD_SPEED_KIB` cap and auto-management off; if more than `REPAIR_DOWNLOAD_ABORT_MB` (1 MB) downloads anyway, the repair aborts. Torrents that verify 100% are resumed and their backups deleted; the rest get their original files restored plus a re-recheck, and are reported as still stuck (attempts tracked in `stuck-repair-state.json`). Nothing is ever removed. A run is skipped below `REPAIR_MIN_FREE_GB` (10 GB) free space, and a lock prevents overlapping runs. In scheduled (daemon) mode, add the flags to the container command as a separate scheduled invocation or run them manually with `docker exec`.
+
 ## Output Format
 
 The script generates a JSON file with the following structure:

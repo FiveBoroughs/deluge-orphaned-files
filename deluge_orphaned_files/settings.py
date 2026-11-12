@@ -88,6 +88,23 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
     relabel_action_delay_days: int = Field(default=7, alias="RELABEL_ACTION_DELAY_DAYS")
     autoremove_min_consecutive_scans: int = Field(default=1, alias="AUTOREMOVE_MIN_CONSECUTIVE_SCANS")
 
+    # Stuck cross-seed repair (see logic/stuck_repair.py). A stuck torrent is
+    # only eligible once it has been paused-incomplete for at least this long,
+    # and a repair run is skipped entirely below the free-space floor: the
+    # recheck guard aborts on unexpected downloads, but a nearly-full pool
+    # should not be gambling with Deluge's resume-during-recheck behaviour.
+    repair_min_age_hours: float = Field(default=24.0, alias="REPAIR_MIN_AGE_HOURS")
+    repair_min_free_gb: float = Field(default=10.0, alias="REPAIR_MIN_FREE_GB")
+    # Files at least this large may be donor-matched on size alone (issue #1:
+    # same release renamed); smaller files require name+size.
+    repair_size_only_min_mb: float = Field(default=50.0, alias="REPAIR_SIZE_ONLY_MIN_MB")
+    # During the verification recheck the torrent is speed-capped and the run
+    # is aborted (and rolled back) if payload downloads exceed this.
+    repair_max_download_speed_kib: float = Field(default=10.0, alias="REPAIR_MAX_DOWNLOAD_SPEED_KIB")
+    repair_download_abort_mb: float = Field(default=1.0, alias="REPAIR_DOWNLOAD_ABORT_MB")
+    # Hashing tens of GB takes a while; this bounds one torrent's recheck wait.
+    repair_recheck_timeout_seconds: int = Field(default=7200, alias="REPAIR_RECHECK_TIMEOUT_SECONDS")
+
     # SMTP / e-mail
     smtp_host: Optional[str] = Field(default=None, alias="SMTP_HOST")
     smtp_port: int = Field(default=465, alias="SMTP_PORT")

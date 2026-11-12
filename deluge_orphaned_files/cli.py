@@ -40,6 +40,7 @@ from .database.hash_cache import (  # noqa: F401 – some imports are kept for b
 )
 from .logic.orphan_finder import InodePreflightError, compute_orphans
 from .logic.autoremove import process_autoremove_labeling
+from .logic.stuck_repair import run_stuck_repair
 from .logic.pending_actions import (
     init_pending_actions_schema,
     execute_pending_actions as execute_all_pending_actions,
@@ -2113,6 +2114,19 @@ def main() -> None:
         help="Execute pending actions that are due (e.g., apply deferred labels). Use with --force to actually apply changes.",
     )
 
+    # Stuck cross-seed repair group (standalone; issue #1)
+    repair_group = parser.add_argument_group("Stuck Torrent Repair")
+    repair_group.add_argument(
+        "--repair-stuck-torrents",
+        action="store_true",
+        help="Dry-run: find paused incomplete cross-seed torrents whose missing files already exist verified in other torrents, and log the hardlinks that would repair them. Standalone, no scan.",
+    )
+    repair_group.add_argument(
+        "--apply-stuck-repairs",
+        action="store_true",
+        help="Actually hardlink donor files into stuck cross-seed torrents and force-recheck them under a download guard (see --repair-stuck-torrents). Runs on its own, without a scan.",
+    )
+
     # Notification testing group
     notification_group = parser.add_argument_group("Notification Testing")
     notification_group.add_argument(
@@ -2142,6 +2156,10 @@ def main() -> None:
     # Early-exit helper flags -------------------------------------------------
     if args.list_env:
         print_loaded_env_vars(config)
+        return
+
+    if args.repair_stuck_torrents or args.apply_stuck_repairs:
+        run_stuck_repair(config, apply=args.apply_stuck_repairs)
         return
 
     if args.debug:
