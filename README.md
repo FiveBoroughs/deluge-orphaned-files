@@ -180,6 +180,7 @@ The Docker entrypoint is a small scheduler (`deluge_orphaned_files/scheduler.py`
 |---|---|
 | `CRON_SCHEDULE` | 5-field cron expression (`minute hour day month weekday`), evaluated in container local time (`TZ`). Empty/unset disables daemon mode. |
 | `RUN_ON_STARTUP` | `true` (default) also runs once immediately at container start; `false` waits for the first scheduled fire. |
+| `NOTIFY_ON_STARTUP` | `false` (default) suppresses the e-mail/Telegram report for that startup run (scheduler appends `--no-notify`); `true` reports startup runs too. |
 
 ```bash
 docker run -d --restart unless-stopped \
@@ -240,8 +241,8 @@ Key tables and concepts:
         *   `'marked_for_deletion'`: User has marked this file for cleanup (future feature).
         *   `'deleted'`: The file has been confirmed as deleted (future feature).
         *   **Behavior**: When a file is detected during a scan, if it already exists in the database for that `source`, its `status` is updated to `'active'`, its `last_seen_at` timestamp is refreshed. New file entries automatically default to `'active' `.
-    *   `consecutive_scans`: An integer count of how many back-to-back scans have identified this file in the given `source` and `path`.
-        *   **Behavior**: If a file is found in one scan, its `consecutive_scans` is 1 (for new entries) or incremented (for existing entries). If it's *not* found in a subsequent scan (e.g., an orphaned file is deleted or added to Deluge), this counter would implicitly stop incrementing for that specific record, and a new record might be created if it appears in a different `source` category, or it might simply not be listed in that scan's results for that original `source`.
+    *   `consecutive_scans`: The number of distinct calendar days on which back-to-back scans have identified this file in the given `source` and `path` (multiple scans on the same day count once, so deployment bursts cannot inflate it).
+        *   **Behavior**: If a file is found on a new day, its `consecutive_scans` is 1 (for new entries, or after a reset) or incremented by 1; additional same-day scans refresh `last_seen_at` without incrementing. If it's *not* found in a subsequent scan (e.g., an orphaned file is deleted or added to Deluge), this counter resets for that record, and a new record might be created if it appears in a different `source` category, or it might simply not be listed in that scan's results for that original `source`.
     *   `first_seen_at` / `last_seen_at`: Timestamps for when the file was first and most recently detected under that specific `path` and `source`.
     *   `include_in_report`: A boolean indicating if the file should be part of standard reporting (primarily for orphaned files).
 *   **`file_scan_history`**: Links files from `orphaned_files` to specific scans in `scan_results`, recording the `source` context for that file in that particular scan.

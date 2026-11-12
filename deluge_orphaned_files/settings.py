@@ -49,7 +49,7 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
         sqlite_cache_path: Path to the SQLite database used for caching.
         cache_save_interval: How frequently to save cache during operations.
         min_file_size_mb: Minimum file size to process (in MB).
-        deletion_consecutive_scans_threshold: Number of consecutive scans before deletion.
+        deletion_consecutive_scans_threshold: Distinct days a file must be seen orphaned before deletion (multiple scans on one day count once).
         deletion_days_threshold: Number of days before deletion is considered.
         smtp_host: SMTP server hostname.
         smtp_port: SMTP server port.

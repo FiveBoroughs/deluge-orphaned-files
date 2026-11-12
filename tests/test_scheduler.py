@@ -115,7 +115,18 @@ def test_startup_run_then_hourly_fires(tmp_path):
         datetime(2026, 1, 1, 1, 0, tzinfo=UTC),  # scheduled
         datetime(2026, 1, 1, 2, 0, tzinfo=UTC),  # scheduled
     ]
-    assert all(argv == ["--sqlite", "--force"] for _, argv in runner.calls)
+    argvs = [argv for _, argv in runner.calls]
+    assert argvs[0] == ["--sqlite", "--force", "--no-notify"]  # startup runs are silent by default
+    assert all(argv == ["--sqlite", "--force"] for argv in argvs[1:])
+
+
+def test_startup_run_notifies_when_opted_in(tmp_path):
+    clock = FakeClock(datetime(2026, 1, 1, 0, 30, tzinfo=UTC))
+    runner = RecordingRunner(clock)
+    sched = make_scheduler(clock, runner, tmp_path, run_on_startup=True, notify_on_startup=True, max_runs=1)
+
+    assert sched.run() == 0
+    assert runner.calls[0][1] == ["--sqlite", "--force"]
 
 
 def test_without_startup_run_first_fire_is_the_schedule(tmp_path):

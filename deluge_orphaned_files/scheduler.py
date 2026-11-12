@@ -87,6 +87,7 @@ class Scheduler:
         argv: Sequence[str],
         *,
         run_on_startup: bool = True,
+        notify_on_startup: bool = False,
         runner: Optional[Callable[[Sequence[str]], int]] = None,
         now_fn: Callable[[], datetime] = _local_now,
         sleep_fn: Optional[Callable[[float], None]] = None,
@@ -97,6 +98,7 @@ class Scheduler:
         self._expression = expression
         self._argv = list(argv)
         self._run_on_startup = run_on_startup
+        self._notify_on_startup = notify_on_startup
         self._runner = runner if runner is not None else self._run_child
         self._now_fn = now_fn
         self._heartbeat_path = Path(heartbeat_path) if heartbeat_path else None
@@ -123,9 +125,10 @@ class Scheduler:
 
     def run(self) -> int:
         logger.info(
-            "Scheduler started: CRON_SCHEDULE={!r} run_on_startup={} args={}",
+            "Scheduler started: CRON_SCHEDULE={!r} run_on_startup={} notify_on_startup={} args={}",
             self._expression,
             self._run_on_startup,
+            self._notify_on_startup,
             self._argv,
         )
         self._touch_heartbeat()
@@ -149,10 +152,16 @@ class Scheduler:
         if self._stop.is_set() or self._max_runs_reached():
             return
         self._touch_heartbeat()
-        logger.info("Starting {} run: {} -m {} {}", kind, sys.executable, CLI_MODULE, " ".join(self._argv))
+        argv = list(self._argv)
+        # A startup run happens on every container recreate; by default it must
+        # not also send a report (opt in with NOTIFY_ON_STARTUP=true). The CLI
+        # remains the single place that decides what --no-notify silences.
+        if kind == "startup" and not self._notify_on_startup and "--no-notify" not in argv:
+            argv.append("--no-notify")
+        logger.info("Starting {} run: {} -m {} {}", kind, sys.executable, CLI_MODULE, " ".join(argv))
         started = time.monotonic()
         try:
-            exit_code = self._runner(self._argv)
+            exit_code = self._runner(argv)
         except Exception as exc:  # the scheduler must outlive a broken run
             logger.exception("Runner raised unexpectedly: {}", exc)
             exit_code = -1
@@ -220,6 +229,7 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[dict] = None) -
         expression,
         args,
         run_on_startup=parse_bool(env.get("RUN_ON_STARTUP"), default=True),
+        notify_on_startup=parse_bool(env.get("NOTIFY_ON_STARTUP"), default=False),
         heartbeat_path=env.get("HEARTBEAT_PATH") or DEFAULT_HEARTBEAT_PATH,
     )
     for sig in (signal.SIGTERM, signal.SIGINT):

@@ -87,17 +87,17 @@ def test_empty_resolved_hash_does_not_clobber_stored_hash(cli, tmp_path, monkeyp
 
     # Scan 1: hash-mode run — the cache resolves a real hash, which is stored.
     _set_cached_hash(db_path, torrent_folder, "movie.mkv", "cafebabe")
-    cli.save_scan_results_to_db([], [entry], [], datetime.now())
+    cli.save_scan_results_to_db([], [entry], [], datetime(2026, 1, 1))
     assert _stored(db_path, "movie.mkv", "torrents") == ("cafebabe", 1)
 
     # Scan 2: inode-mode run — no hashing happened, the cache lookup misses.
     _set_cached_hash(db_path, torrent_folder, "movie.mkv", None)
-    cli.save_scan_results_to_db([], [entry], [], datetime.now())
+    cli.save_scan_results_to_db([], [entry], [], datetime(2026, 1, 2))
     assert _stored(db_path, "movie.mkv", "torrents") == ("cafebabe", 2)
 
     # Scan 3: hash-mode again with a changed file — the new hash must still win.
     _set_cached_hash(db_path, torrent_folder, "movie.mkv", "deadbeef")
-    cli.save_scan_results_to_db([], [entry], [], datetime.now())
+    cli.save_scan_results_to_db([], [entry], [], datetime(2026, 1, 3))
     assert _stored(db_path, "movie.mkv", "torrents") == ("deadbeef", 3)
 
 
@@ -115,11 +115,11 @@ def test_hash_preserved_for_orphan_and_media_sources_too(cli, tmp_path, monkeypa
 
     _set_cached_hash(db_path, torrent_folder, "orphan.mkv", "aaaa1111")
     _set_cached_hash(db_path, media_folder, "media.mkv", "bbbb2222")
-    cli.save_scan_results_to_db([orphan], [], [media], datetime.now())
+    cli.save_scan_results_to_db([orphan], [], [media], datetime(2026, 1, 1))
 
     _set_cached_hash(db_path, torrent_folder, "orphan.mkv", None)
     _set_cached_hash(db_path, media_folder, "media.mkv", None)
-    cli.save_scan_results_to_db([orphan], [], [media], datetime.now())
+    cli.save_scan_results_to_db([orphan], [], [media], datetime(2026, 1, 2))
 
     assert _stored(db_path, "orphan.mkv", "local_torrent_folder") == ("aaaa1111", 2)
     assert _stored(db_path, "media.mkv", "media") == ("bbbb2222", 2)
@@ -139,12 +139,12 @@ def test_scan_preserves_current_deletion_marks_and_clears_stale_ones(cli, tmp_pa
     current = {"path": "current-orphan.mkv", "size": 1, "size_human": "0.00 MB"}
     reacquired = {"path": "reacquired-by-deluge.mkv", "size": 1, "size_human": "0.00 MB"}
 
-    cli.save_scan_results_to_db([current, reacquired], [], [], datetime.now())
+    cli.save_scan_results_to_db([current, reacquired], [], [], datetime(2026, 1, 1))
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute("UPDATE orphaned_files SET status = 'marked_for_deletion' WHERE source = 'local_torrent_folder'")
 
     # The next scan still considers one path orphaned; the other is no longer an orphan.
-    cli.save_scan_results_to_db([current], [], [], datetime.now())
+    cli.save_scan_results_to_db([current], [], [], datetime(2026, 1, 2))
 
     assert _stored_retention_state(db_path, "current-orphan.mkv") == ("marked_for_deletion", 2)
     assert _stored_retention_state(db_path, "reacquired-by-deluge.mkv") == ("inactive", 0)
@@ -154,16 +154,140 @@ def test_force_deletion_cycle_deletes_old_marks_then_marks_current_candidates(cl
     """The always-force production schedule must still prepare work for its next run."""
     calls = []
 
-    def record_call(*, force_delete, db_path, torrent_base_folder):
-        calls.append((force_delete, db_path, torrent_base_folder))
+    def record_call(*, force_delete, db_path, torrent_base_folder, scans_threshold):
+        calls.append((force_delete, db_path, torrent_base_folder, scans_threshold))
 
     monkeypatch.setattr(cli, "process_deletions", record_call)
 
     db_path = tmp_path / "cycle.db"
     torrent_base = tmp_path / "torrents"
-    cli._process_deletion_cycle(force_delete=True, db_path=db_path, torrent_base_folder=torrent_base)
+    cli._process_deletion_cycle(force_delete=True, db_path=db_path, torrent_base_folder=torrent_base, scans_threshold=4)
 
     assert calls == [
-        (True, db_path, torrent_base),
-        (False, db_path, torrent_base),
+        (True, db_path, torrent_base, 4),
+        (False, db_path, torrent_base, 4),
     ]
+
+
+def test_consecutive_scans_count_distinct_days_not_scans(cli, tmp_path, monkeypatch):
+    """A redeploy burst (many scans in one day) must not inflate consecutive_scans.
+
+    The counter gates deletion and autoremove labeling; run_on_startup means every
+    container recreate is another scan, so only sightings on distinct calendar
+    days may advance it. scan_start_time is the authoritative sighting time.
+    """
+    db_path = tmp_path / "days.db"
+    monkeypatch.setattr(cli.config, "sqlite_cache_path", db_path)
+    cli.init_sqlite_cache(db_path)
+
+    orphan = {"path": "orphan.mkv", "size": 1, "size_human": "0.00 MB"}
+
+    # Two scans on the same calendar day: still one sighting day.
+    cli.save_scan_results_to_db([orphan], [], [], datetime(2026, 1, 1, 2, 0, 0))
+    cli.save_scan_results_to_db([orphan], [], [], datetime(2026, 1, 1, 23, 0, 0))
+    assert _stored_retention_state(db_path, "orphan.mkv") == ("active", 1)
+
+    # Next calendar day advances the counter.
+    cli.save_scan_results_to_db([orphan], [], [], datetime(2026, 1, 2, 2, 0, 0))
+    assert _stored_retention_state(db_path, "orphan.mkv") == ("active", 2)
+
+    # A legacy row inflated by the old per-scan counting (e.g. 9 scans in one
+    # day) must converge to distinct sighting days on its next sighting: the
+    # counter can never exceed the calendar span first_seen..last_seen.
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("UPDATE orphaned_files SET consecutive_scans = 9 WHERE path = 'orphan.mkv'")
+    cli.save_scan_results_to_db([orphan], [], [], datetime(2026, 1, 3, 2, 0, 0))
+    assert _stored_retention_state(db_path, "orphan.mkv") == ("active", 3)
+
+    # Absent from a scan: reset. Seen again the same day: fresh run starts at 1.
+    cli.save_scan_results_to_db([], [], [], datetime(2026, 1, 4, 2, 0, 0))
+    assert _stored_retention_state(db_path, "orphan.mkv") == ("inactive", 0)
+    cli.save_scan_results_to_db([orphan], [], [], datetime(2026, 1, 4, 20, 0, 0))
+    assert _stored_retention_state(db_path, "orphan.mkv") == ("active", 1)
+
+
+def test_legacy_counters_converted_from_recorded_sightings(cli, tmp_path, monkeypatch):
+    """Pre-existing DBs hold per-scan counters; conversion must recompute sighting days.
+
+    Covers gaps the span clamp cannot: sightings on Jan 1, Jan 2 and a Jan 10 burst
+    are 3 sighting days (not span 10), a scan where the file was absent ends the
+    trailing run, and an entirely empty orphan scan (no history rows at all) also
+    ends it — 'local_torrent_folder' is recorded on every scan. Runs once, gated
+    by PRAGMA user_version.
+    """
+    db_path = tmp_path / "legacy.db"
+    monkeypatch.setattr(cli.config, "sqlite_cache_path", db_path)
+    cli.init_sqlite_cache(db_path)
+
+    def _counter(path):
+        with sqlite3.connect(str(db_path)) as conn:
+            return conn.execute("SELECT consecutive_scans FROM orphaned_files WHERE path = ?", (path,)).fetchone()[0]
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA user_version = 0")  # simulate a database created before the conversion existed
+        scan_ids = []
+        for start in (
+            "2026-01-01T02:00:00",
+            "2026-01-02T02:00:00",
+            "2026-01-10T01:00:00",
+            "2026-01-10T02:00:00",
+            "2026-01-10T03:00:00",
+            "2026-01-11T02:00:00",  # s6: empty scan — no orphans found, no history rows
+            "2026-01-12T02:00:00",  # s7
+        ):
+            cur = conn.execute("INSERT INTO scan_results (host, base_path, scan_start, scan_end) VALUES ('h', '/data', ?, ?)", (start, start))
+            scan_ids.append(cur.lastrowid)
+        s1, s2, s3, s4, s5, s6, s7 = scan_ids
+
+        def _row(path, stored):
+            cur = conn.execute(
+                "INSERT INTO orphaned_files (file_hash, path, source, size, size_human, first_seen_at, last_seen_at, consecutive_scans, status, include_in_report) "
+                "VALUES ('', ?, 'local_torrent_folder', 1, '1 MB', '2026-01-01T02:00:00', '2026-01-12T02:00:00', ?, 'active', 1)",
+                (path, stored),
+            )
+            return cur.lastrowid
+
+        burst = _row("burst.mkv", 9)  # sighted every scan up to s5: 3 distinct days
+        gapped = _row("gapped.mkv", 9)  # absent from s2: trailing run is Jan 10 only
+        _row("no-history.mkv", 7)  # no sightings recorded at all
+        reset = _row("reset.mkv", 8)  # full streak, then the empty s6 scan, then sighted again at s7
+        sightings = [(s, burst) for s in (s1, s2, s3, s4, s5)] + [(s, gapped) for s in (s1, s3, s4, s5)] + [(s, reset) for s in (s1, s2, s3, s4, s5, s7)]
+        for scan_id, file_id in sightings:
+            conn.execute("INSERT INTO file_scan_history (scan_id, file_id, source) VALUES (?, ?, 'local_torrent_folder')", (scan_id, file_id))
+
+    cli.init_sqlite_cache(db_path)
+
+    assert _counter("burst.mkv") == 3
+    assert _counter("gapped.mkv") == 1
+    assert _counter("no-history.mkv") == 1
+    assert _counter("reset.mkv") == 1
+
+    # One-time only: a later init must not recompute again.
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("UPDATE orphaned_files SET consecutive_scans = 44 WHERE path = 'burst.mkv'")
+    cli.init_sqlite_cache(db_path)
+    assert _counter("burst.mkv") == 44
+
+
+def test_dispatch_notifications_respects_no_notify(cli, monkeypatch):
+    """--no-notify (appended by the scheduler for startup runs) silences both channels."""
+    sent = {"email": 0, "telegram": 0}
+    monkeypatch.setattr(cli, "send_scan_report", lambda **kw: sent.__setitem__("email", sent["email"] + 1))
+    monkeypatch.setattr(cli, "send_telegram_report", lambda **kw: sent.__setitem__("telegram", sent["telegram"] + 1))
+    monkeypatch.setattr(cli, "_format_scan_results", lambda *a, **k: "report body")
+    for attr, value in {
+        "smtp_host": "smtp.example",
+        "smtp_username": "user",
+        "smtp_password": "pass",
+        "smtp_from_addr": "from@example",
+        "smtp_to_addrs": ["to@example"],
+        "telegram_bot_token": "token",
+        "telegram_chat_id": "123",
+    }.items():
+        monkeypatch.setattr(cli.config, attr, value)
+
+    cli._dispatch_notifications(scan_id=1, no_notify=True)
+    assert sent == {"email": 0, "telegram": 0}
+
+    cli._dispatch_notifications(scan_id=1, no_notify=False)
+    assert sent == {"email": 1, "telegram": 1}
