@@ -193,6 +193,22 @@ docker run -d --restart unless-stopped \
 
 Runs never overlap; a run that overruns its slot skips the missed fire rather than queueing a catch-up. A failed run is logged and the schedule continues. `docker stop` is handled cleanly (SIGTERM is forwarded to a running scan). A heartbeat file backs the image HEALTHCHECK while idling.
 
+
+#### Exit codes and container health
+
+The CLI exits with a meaningful code (also in `--help`):
+
+| Code | Meaning |
+|---|---|
+| 0 | Completed |
+| 1 | Failed (e.g. scan error, Deluge unreachable for stuck-torrent repair, test notification could not be sent) |
+| 2 | Usage/configuration error (the request cannot be served as asked, e.g. `--show-last` without `--sqlite`, test notification without its configuration) |
+| 3 | Partial: scan saved, but a secondary step (autoremove labeling, e-mail/Telegram report) failed |
+
+After every run the scheduler records the outcome (exit code, finish time, consecutive-failure streak) in a status file (`STATUS_PATH`, default `/tmp/delugeof-last-run.json`). The image HEALTHCHECK fails when the heartbeat is stale (>180s, scheduler stuck) **or** two consecutive runs have failed — so a nightly run that keeps erroring shows up as an unhealthy container instead of silently doing nothing. One transient failure does not trip it.
+
+> **Log rotation:** the container logs every run to stdout (JSON-file driver by default). Cap it, e.g. Docker Compose `logging: {driver: json-file, options: {max-size: "10m", max-file: "3"}}` or the equivalent in your orchestrator, so years of nightly runs don't grow unbounded.
+
 **Migrating from an external cron/start-on-schedule setup** (e.g. TrueNAS cron job starting the container): set `CRON_SCHEDULE`, change the app restart policy to *unless-stopped*, and remove the external cron job.
 
 ### Repairing stuck cross-seed torrents

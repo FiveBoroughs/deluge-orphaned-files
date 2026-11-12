@@ -8,13 +8,16 @@ no-CRON_SCHEDULE path execs the CLI exactly like the old one-shot container.
 
 from __future__ import annotations
 
+import json
+import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from deluge_orphaned_files import scheduler
-from deluge_orphaned_files.scheduler import Scheduler, next_run, parse_bool, validate_schedule
+from deluge_orphaned_files.scheduler import Scheduler, healthcheck, next_run, parse_bool, validate_schedule
 
 UTC = timezone.utc
 
@@ -49,6 +52,7 @@ class RecordingRunner:
 
 def make_scheduler(clock: FakeClock, runner, tmp_path, **kwargs) -> Scheduler:
     kwargs.setdefault("heartbeat_path", str(tmp_path / "heartbeat"))
+    kwargs.setdefault("status_path", str(tmp_path / "status.json"))
     return Scheduler(
         kwargs.pop("expression", "0 * * * *"),
         ["--sqlite", "--force"],
@@ -189,6 +193,70 @@ def test_heartbeat_file_is_touched(tmp_path):
 
     sched.run()
     assert (tmp_path / "heartbeat").exists()
+
+
+def _read_status(tmp_path):
+    return json.loads((tmp_path / "status.json").read_text())
+
+
+def test_status_file_tracks_consecutive_failures(tmp_path):
+    """The Docker HEALTHCHECK needs run outcomes, not just liveness."""
+    clock = FakeClock(datetime(2026, 1, 1, 0, 30, tzinfo=UTC))
+    runner = RecordingRunner(clock, exit_codes=(1, 1))
+    sched = make_scheduler(clock, runner, tmp_path, run_on_startup=True, max_runs=2)
+
+    assert sched.run() == 0
+    status = _read_status(tmp_path)
+    assert status["last_exit_code"] == 1
+    assert status["consecutive_failures"] == 2
+    assert status["runs_completed"] == 2
+    assert status["last_finished_at"].startswith("2026-01-01")
+
+
+def test_status_file_resets_failure_streak_on_success(tmp_path):
+    clock = FakeClock(datetime(2026, 1, 1, 0, 30, tzinfo=UTC))
+    runner = RecordingRunner(clock, exit_codes=(3, 0))
+    sched = make_scheduler(clock, runner, tmp_path, run_on_startup=True, max_runs=2)
+
+    assert sched.run() == 0
+    status = _read_status(tmp_path)
+    assert status["last_exit_code"] == 0
+    assert status["consecutive_failures"] == 0
+
+
+# -- healthcheck -----------------------------------------------------------------
+
+
+def _touch_with_age(path, age_seconds: float) -> None:
+    path.write_text("")
+    past = time.time() - age_seconds
+    os.utime(path, (past, past))
+
+
+def test_healthcheck_matrix(tmp_path):
+    heartbeat = tmp_path / "heartbeat"
+    status = tmp_path / "status.json"
+
+    # One-shot mode: no heartbeat file, nothing idle to supervise.
+    assert healthcheck(heartbeat_path=str(heartbeat), status_path=str(status)) == 0
+
+    # Fresh heartbeat, no completed run yet.
+    _touch_with_age(heartbeat, 0)
+    assert healthcheck(heartbeat_path=str(heartbeat), status_path=str(status)) == 0
+
+    # One failed run is tolerated; two in a row fail the check.
+    status.write_text(json.dumps({"consecutive_failures": 1}))
+    assert healthcheck(heartbeat_path=str(heartbeat), status_path=str(status)) == 0
+    status.write_text(json.dumps({"consecutive_failures": 2}))
+    assert healthcheck(heartbeat_path=str(heartbeat), status_path=str(status)) == 1
+
+    # A corrupt status file must not flap the container unhealthy.
+    status.write_text("not json")
+    assert healthcheck(heartbeat_path=str(heartbeat), status_path=str(status)) == 0
+
+    # Stale heartbeat: scheduler itself is stuck.
+    _touch_with_age(heartbeat, 10_000)
+    assert healthcheck(heartbeat_path=str(heartbeat), status_path=str(status)) == 1
 
 
 # -- entrypoint dispatch ---------------------------------------------------------

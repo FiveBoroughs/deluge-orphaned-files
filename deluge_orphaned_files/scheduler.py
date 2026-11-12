@@ -17,13 +17,16 @@ previous run finishes, so a run that overruns its slot simply skips the
 missed fire(s) instead of queuing a catch-up.
 
 A heartbeat file (``HEARTBEAT_PATH``) is refreshed while waiting and while a
-child run is in progress; the Docker HEALTHCHECK uses its mtime to detect a
-stuck scheduler. This module deliberately does not import ``.settings`` or
-``.cli``: it must start (and report config errors) even when the CLI's own
+child run is in progress. After each run the scheduler records its outcome
+(exit code, consecutive-failure streak) in a status file (``STATUS_PATH``).
+The Docker HEALTHCHECK (``healthcheck()`` below) combines both: fresh
+heartbeat and fewer than two consecutive failed runs. This module deliberately
+does not import ``.settings`` or ``.cli``: it must start (and report config errors) even when the CLI's own
 configuration is missing, and child processes give each run a fresh
 interpreter (no leaked state, memory, or half-open Deluge sessions).
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -39,6 +42,7 @@ from loguru import logger
 
 CLI_MODULE = "deluge_orphaned_files.cli"
 DEFAULT_HEARTBEAT_PATH = "/tmp/delugeof-heartbeat"
+DEFAULT_STATUS_PATH = "/tmp/delugeof-last-run.json"
 # Long sleeps are sliced so SIGTERM is honoured and the heartbeat stays fresh
 # without busy-waiting.
 WAIT_SLICE_SECONDS = 30.0
@@ -92,6 +96,7 @@ class Scheduler:
         now_fn: Callable[[], datetime] = _local_now,
         sleep_fn: Optional[Callable[[float], None]] = None,
         heartbeat_path: Optional[str] = DEFAULT_HEARTBEAT_PATH,
+        status_path: Optional[str] = DEFAULT_STATUS_PATH,
         max_runs: Optional[int] = None,
     ) -> None:
         validate_schedule(expression)
@@ -102,6 +107,7 @@ class Scheduler:
         self._runner = runner if runner is not None else self._run_child
         self._now_fn = now_fn
         self._heartbeat_path = Path(heartbeat_path) if heartbeat_path else None
+        self._status_path = Path(status_path) if status_path else None
         self._max_runs = max_runs
         self._stop = threading.Event()
         # Default sleeper is the stop event itself: sleep ends the instant
@@ -110,6 +116,7 @@ class Scheduler:
         self._stop_at: Optional[float] = None
         self._child: Optional[subprocess.Popen] = None
         self._runs_completed = 0
+        self._consecutive_failures = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -166,6 +173,8 @@ class Scheduler:
             logger.exception("Runner raised unexpectedly: {}", exc)
             exit_code = -1
         self._runs_completed += 1
+        self._consecutive_failures = 0 if exit_code == 0 else self._consecutive_failures + 1
+        self._write_status(exit_code)
         self._touch_heartbeat()
         elapsed = time.monotonic() - started
         if exit_code == 0:
@@ -206,6 +215,60 @@ class Scheduler:
         except OSError as exc:
             logger.warning("Could not update heartbeat {}: {}", self._heartbeat_path, exc)
 
+    def _write_status(self, exit_code: int) -> None:
+        """Record the last run's outcome for the HEALTHCHECK (atomic replace)."""
+        if self._status_path is None:
+            return
+        payload = {
+            "last_exit_code": exit_code,
+            "last_finished_at": self._now_fn().isoformat(),
+            "consecutive_failures": self._consecutive_failures,
+            "runs_completed": self._runs_completed,
+        }
+        try:
+            tmp_path = self._status_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload))
+            os.replace(tmp_path, self._status_path)
+        except OSError as exc:
+            logger.warning("Could not update status file {}: {}", self._status_path, exc)
+
+
+def healthcheck(
+    *,
+    heartbeat_path: Optional[str] = None,
+    status_path: Optional[str] = None,
+    max_heartbeat_age_seconds: float = 180.0,
+    max_consecutive_failures: int = 2,
+    now: Optional[float] = None,
+) -> int:
+    """Docker HEALTHCHECK probe: 0 healthy, 1 unhealthy.
+
+    Healthy means the scheduler is alive (heartbeat fresh) *and* runs are not
+    persistently failing (fewer than ``max_consecutive_failures`` non-zero exits
+    in a row, per the status file the scheduler writes after each run). A
+    missing heartbeat file means one-shot mode — nothing idle to supervise, so
+    healthy. A missing/corrupt status file proves no failures, so it never
+    flaps the container unhealthy by itself.
+    """
+    heartbeat = Path(heartbeat_path or os.environ.get("HEARTBEAT_PATH") or DEFAULT_HEARTBEAT_PATH)
+    if not heartbeat.exists():
+        return 0
+    current = time.time() if now is None else now
+    try:
+        if current - heartbeat.stat().st_mtime >= max_heartbeat_age_seconds:
+            return 1
+    except OSError:
+        return 1
+
+    status = Path(status_path or os.environ.get("STATUS_PATH") or DEFAULT_STATUS_PATH)
+    try:
+        data = json.loads(status.read_text())
+        if int(data.get("consecutive_failures") or 0) >= max_consecutive_failures:
+            return 1
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return 0
+
 
 def main(argv: Optional[Sequence[str]] = None, environ: Optional[dict] = None) -> int:
     args: List[str] = list(sys.argv[1:] if argv is None else argv)
@@ -231,6 +294,7 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[dict] = None) -
         run_on_startup=parse_bool(env.get("RUN_ON_STARTUP"), default=True),
         notify_on_startup=parse_bool(env.get("NOTIFY_ON_STARTUP"), default=False),
         heartbeat_path=env.get("HEARTBEAT_PATH") or DEFAULT_HEARTBEAT_PATH,
+        status_path=env.get("STATUS_PATH") or DEFAULT_STATUS_PATH,
     )
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: scheduler.stop())

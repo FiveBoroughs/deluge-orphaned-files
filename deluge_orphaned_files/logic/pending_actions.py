@@ -732,13 +732,17 @@ def execute_pending_actions(
                         successful_count += 1
                     else:
                         if reason == "not_found":
-                            # Torrent no longer exists; cancel further retries
+                            # Torrent no longer exists; cancel further retries.
+                            # Deliberate cancellation is routine churn (torrent
+                            # removed during the waiting period), not a failure:
+                            # count it as skipped so it cannot trip run health.
                             update_action_status(
                                 db_path,
                                 action_id,
                                 ActionStatus.CANCELLED,
                                 "Torrent no longer exists in Deluge",
                             )
+                            skipped_count += 1
                         else:
                             # Keep as pending for other failures so it can be retried
                             update_action_status(
@@ -747,8 +751,7 @@ def execute_pending_actions(
                                 ActionStatus.PENDING,
                                 f"Failed to apply label to torrent: {file_path}",
                             )
-                        failed_count += 1
-
+                            failed_count += 1
             elif action_type == ActionType.MANUAL_REVIEW:
                 # Manual review actions just get logged, they can't be automated
                 logger.info(f"File requires manual review: {file_path}")

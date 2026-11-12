@@ -270,10 +270,23 @@ def test_legacy_counters_converted_from_recorded_sightings(cli, tmp_path, monkey
 
 
 def test_dispatch_notifications_respects_no_notify(cli, monkeypatch):
-    """--no-notify (appended by the scheduler for startup runs) silences both channels."""
+    """--no-notify (appended by the scheduler for startup runs) silences both channels.
+
+    The return value reports whether every configured send succeeded, so main()
+    can map a failed send to the partial-failure exit code.
+    """
     sent = {"email": 0, "telegram": 0}
-    monkeypatch.setattr(cli, "send_scan_report", lambda **kw: sent.__setitem__("email", sent["email"] + 1))
-    monkeypatch.setattr(cli, "send_telegram_report", lambda **kw: sent.__setitem__("telegram", sent["telegram"] + 1))
+
+    def _send_email(**kw):
+        sent["email"] += 1
+        return True
+
+    def _send_telegram(**kw):
+        sent["telegram"] += 1
+        return True
+
+    monkeypatch.setattr(cli, "send_scan_report", _send_email)
+    monkeypatch.setattr(cli, "send_telegram_report", _send_telegram)
     monkeypatch.setattr(cli, "_format_scan_results", lambda *a, **k: "report body")
     for attr, value in {
         "smtp_host": "smtp.example",
@@ -286,8 +299,83 @@ def test_dispatch_notifications_respects_no_notify(cli, monkeypatch):
     }.items():
         monkeypatch.setattr(cli.config, attr, value)
 
-    cli._dispatch_notifications(scan_id=1, no_notify=True)
+    assert cli._dispatch_notifications(scan_id=1, no_notify=True) is True
     assert sent == {"email": 0, "telegram": 0}
 
-    cli._dispatch_notifications(scan_id=1, no_notify=False)
+    assert cli._dispatch_notifications(scan_id=1, no_notify=False) is True
     assert sent == {"email": 1, "telegram": 1}
+
+    monkeypatch.setattr(cli, "send_telegram_report", lambda **kw: False)
+    assert cli._dispatch_notifications(scan_id=1, no_notify=False) is False
+
+
+def _run_main(cli, monkeypatch, argv):
+    monkeypatch.setattr("sys.argv", ["deluge-orphaned-files", *argv])
+    return cli.main()
+
+
+def test_main_exit_codes_usage_and_scan_failure(cli, tmp_path, monkeypatch):
+    """0 ok / 1 failed / 2 usage-or-config: the scheduler and Docker need real codes."""
+    monkeypatch.setattr(cli.config, "sqlite_cache_path", tmp_path / "exit.db")
+
+    # Requesting DB-backed output without --sqlite cannot be served.
+    assert _run_main(cli, monkeypatch, ["--show-last"]) == 2
+
+    # A test notification without its configuration is a usage error too.
+    monkeypatch.setattr(cli.config, "smtp_host", None)
+    assert _run_main(cli, monkeypatch, ["--test-email"]) == 2
+
+    def _preflight_boom(**kwargs):
+        raise cli.InodePreflightError("different filesystems")
+
+    monkeypatch.setattr(cli, "find_orphaned_files", _preflight_boom)
+    assert _run_main(cli, monkeypatch, ["--sqlite"]) == 1
+
+    def _scan_boom(**kwargs):
+        raise RuntimeError("deluge unreachable")
+
+    monkeypatch.setattr(cli, "find_orphaned_files", _scan_boom)
+    assert _run_main(cli, monkeypatch, ["--sqlite"]) == 1
+
+
+def test_main_exit_codes_success_and_partial(cli, tmp_path, monkeypatch):
+    import deluge_client
+
+    monkeypatch.setattr(cli.config, "sqlite_cache_path", tmp_path / "exit.db")
+    monkeypatch.setattr(cli.config, "smtp_host", None)
+    monkeypatch.setattr(cli.config, "telegram_bot_token", None)
+
+    class _FakeDelugeClient:
+        connected = True
+
+        def __init__(self, **kwargs):
+            pass
+
+        def connect(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr(deluge_client, "DelugeRPCClient", _FakeDelugeClient)
+    monkeypatch.setattr(cli, "find_orphaned_files", lambda **kwargs: 7)
+    monkeypatch.setattr(cli, "process_autoremove_labeling", lambda **kwargs: {"errors": 0})
+    monkeypatch.setattr(cli, "_process_deletion_cycle", lambda **kwargs: None)
+    monkeypatch.setattr(cli, "_format_scan_results", lambda *a, **k: "table")
+
+    assert _run_main(cli, monkeypatch, ["--sqlite"]) == 0
+
+    # Labeling reports failures via its returned stats (it swallows exceptions
+    # internally); those must surface as partial, not silent success.
+    monkeypatch.setattr(cli, "process_autoremove_labeling", lambda **kwargs: {"errors": 2})
+    assert _run_main(cli, monkeypatch, ["--sqlite"]) == 3
+    monkeypatch.setattr(cli, "process_autoremove_labeling", lambda **kwargs: {"errors": 0})
+
+    # Same for pending-action execution failures.
+    monkeypatch.setattr(cli, "execute_pending_actions", lambda **kwargs: (0, 1, 0))
+    assert _run_main(cli, monkeypatch, ["--sqlite", "--execute-pending-actions", "--force"]) == 3
+    monkeypatch.setattr(cli, "execute_pending_actions", lambda **kwargs: (1, 0, 0))
+
+    # And for a failed notification send.
+    monkeypatch.setattr(cli, "_dispatch_notifications", lambda **kwargs: False)
+    assert _run_main(cli, monkeypatch, ["--sqlite"]) == 3

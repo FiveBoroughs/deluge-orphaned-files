@@ -153,17 +153,20 @@ def _send_in_chunks(*, bot_token: str, chat_id: str, title: str, content: str, c
     return True
 
 
-def send_scan_report(*, bot_token: str, chat_id: str, report_body: str) -> None:
+def send_scan_report(*, bot_token: str, chat_id: str, report_body: str) -> bool:
     """Send report body via Telegram.
 
     Args:
         bot_token: Bot token obtained from @BotFather.
         chat_id: Destination chat (user ID or channel/group ID).
         report_body: Text payload to send (will be split into multiple messages if needed).
+
+    Returns:
+        bool: True if every chunk was sent, False otherwise.
     """
     if not bot_token or not chat_id:
         logger.warning("Telegram bot token or chat_id not configured; skipping Telegram notification.")
-        return
+        return False
 
     title = "Deluge Orphaned Files Scan Report"
-    _send_in_chunks(bot_token=bot_token, chat_id=chat_id, title=title, content=report_body)
+    return _send_in_chunks(bot_token=bot_token, chat_id=chat_id, title=title, content=report_body)

@@ -39,7 +39,7 @@ def _build_message(subject: str, body: str, from_addr: str, to_addrs: list[str])
     return msg
 
 
-def send_scan_report(*, smtp_host: str, smtp_port: int, username: str, password: str, from_addr: str, to_addrs: list[str], report_body: str, use_ssl: bool = True) -> None:
+def send_scan_report(*, smtp_host: str, smtp_port: int, username: str, password: str, from_addr: str, to_addrs: list[str], report_body: str, use_ssl: bool = True) -> bool:
     """Send scan report via SMTP.
 
     All parameters except use_ssl are mandatory. If any error occurs during sending,
@@ -54,10 +54,13 @@ def send_scan_report(*, smtp_host: str, smtp_port: int, username: str, password:
         to_addrs: List of recipient email addresses.
         report_body: Email message content to send.
         use_ssl: Whether to use SSL/TLS connection (default True).
+
+    Returns:
+        bool: True if the message was sent, False otherwise (errors are logged, never raised).
     """
     if not to_addrs:
         logger.warning("No e-mail recipients configured; skipping e-mail sending.")
-        return
+        return False
 
     subject = f"Deluge Orphaned Files Report – {datetime.now().date()}"
     msg = _build_message(subject, report_body, from_addr, to_addrs)
@@ -74,5 +77,7 @@ def send_scan_report(*, smtp_host: str, smtp_port: int, username: str, password:
                 server.login(username, password)
                 server.send_message(msg)
         logger.success("Scan report e-mail sent to {}", ", ".join(to_addrs))
+        return True
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to send report e-mail: {}", exc)
+        return False

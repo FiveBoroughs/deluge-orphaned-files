@@ -1330,7 +1330,7 @@ def execute_pending_actions(
     db_path: Path,
     client: "DelugeRPCClient",
     dry_run: bool = False,
-) -> None:
+) -> Tuple[int, int, int]:
     """
     Process pending actions that are due for execution.
 
@@ -1341,6 +1341,10 @@ def execute_pending_actions(
         db_path (Path): Path to the SQLite database.
         client (DelugeRPCClient): An active Deluge RPC client instance.
         dry_run (bool): If True, only simulate the execution without actually making changes.
+
+    Returns:
+        Tuple of (successful_count, failed_count, skipped_count) from the
+        pending_actions module, so callers can surface failures.
     """
 
     # Define callbacks for actions
@@ -1407,7 +1411,7 @@ def execute_pending_actions(
             return False
 
     # Execute all pending actions using the dedicated module
-    execute_all_pending_actions(
+    return execute_all_pending_actions(
         db_path=db_path,
         apply_relabel_callback=apply_relabel_callback,
         delete_file_callback=delete_file_callback,
@@ -1415,29 +1419,46 @@ def execute_pending_actions(
     )
 
 
-def _dispatch_notifications(*, scan_id: int, no_notify: bool) -> None:
+# Exit codes: the scheduler records these per run, and two consecutive non-zero
+# runs fail the Docker HEALTHCHECK. Keep the set small and stable.
+EXIT_OK = 0
+EXIT_FAILURE = 1  # the requested operation could not be completed
+EXIT_USAGE = 2  # cannot run as asked (flag combination / missing configuration)
+EXIT_PARTIAL = 3  # primary work saved, but a secondary step (labeling, notification) failed
+
+
+def _dispatch_notifications(*, scan_id: int, no_notify: bool) -> bool:
     """Send the scan report via e-mail and/or Telegram, unless suppressed.
 
     ``--no-notify`` (appended by the scheduler for startup runs) silences both
     channels for this run; the report is not formatted at all in that case.
+
+    Returns:
+        bool: True if suppressed, unconfigured, or every configured send
+        succeeded; False if a configured send failed.
     """
     if no_notify:
         logger.info("Notifications suppressed for this run (--no-notify); skipping e-mail/Telegram report.")
-        return
+        return True
+
+    all_ok = True
 
     # Send e-mail notification if SMTP is configured and we have a valid scan_id
     if scan_id > 0 and config.smtp_host and config.smtp_username and config.smtp_password and config.smtp_from_addr and config.smtp_to_addrs:
         logger.info("Preparing e-mail report …")
         report_body = _format_scan_results(config.sqlite_cache_path, scan_id=scan_id)
-        send_scan_report(
-            smtp_host=config.smtp_host,
-            smtp_port=config.smtp_port,
-            username=config.smtp_username,
-            password=config.smtp_password,
-            from_addr=config.smtp_from_addr,
-            to_addrs=config.smtp_to_addrs,
-            report_body=report_body,
-            use_ssl=config.smtp_use_ssl,
+        all_ok = (
+            send_scan_report(
+                smtp_host=config.smtp_host,
+                smtp_port=config.smtp_port,
+                username=config.smtp_username,
+                password=config.smtp_password,
+                from_addr=config.smtp_from_addr,
+                to_addrs=config.smtp_to_addrs,
+                report_body=report_body,
+                use_ssl=config.smtp_use_ssl,
+            )
+            and all_ok
         )
     else:
         logger.debug("SMTP configuration incomplete or e-mail disabled; skipping notification.")
@@ -1445,16 +1466,21 @@ def _dispatch_notifications(*, scan_id: int, no_notify: bool) -> None:
     # Telegram notification
     if scan_id > 0 and config.telegram_bot_token and config.telegram_chat_id:
         report_body = _format_scan_results(config.sqlite_cache_path, scan_id=scan_id)
-        send_telegram_report(
-            bot_token=config.telegram_bot_token,
-            chat_id=config.telegram_chat_id,
-            report_body=report_body,
+        all_ok = (
+            send_telegram_report(
+                bot_token=config.telegram_bot_token,
+                chat_id=config.telegram_chat_id,
+                report_body=report_body,
+            )
+            and all_ok
         )
     else:
         logger.debug("Telegram configuration incomplete or notification disabled; skipping notification.")
 
+    return all_ok
 
-def main() -> None:
+
+def main() -> int:
     """
     Main entry point for the Deluge Orphaned Files application.
 
@@ -1465,13 +1491,17 @@ def main() -> None:
     - Processing file deletions for orphaned files
     - Applying auto-remove labels to torrents
     - Displaying scan results and history
+
+    Returns:
+        Process exit code: EXIT_OK (0), EXIT_FAILURE (1), EXIT_USAGE (2), or
+        EXIT_PARTIAL (3) when the scan was saved but labeling/notifications failed.
     """
     print_version_info()
 
     # Create parser with description and version info
     parser = argparse.ArgumentParser(
         description="Deluge Orphaned Files - Find and manage orphaned torrent files",
-        epilog="For more information, visit https://github.com/FiveBoroughs/deluge-orphaned-files",
+        epilog="Exit codes: 0 ok, 1 failed, 2 usage/configuration error, 3 partial (scan saved, secondary step failed). https://github.com/FiveBoroughs/deluge-orphaned-files",
     )
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
 
@@ -1600,11 +1630,13 @@ def main() -> None:
     # Early-exit helper flags -------------------------------------------------
     if args.list_env:
         print_loaded_env_vars(config)
-        return
+        return EXIT_OK
 
     if args.repair_stuck_torrents or args.apply_stuck_repairs:
-        run_stuck_repair(config, apply=args.apply_stuck_repairs)
-        return
+        stats = run_stuck_repair(config, apply=args.apply_stuck_repairs)
+        # Designed skips (lock held by another run, low free space) are still a
+        # completed invocation; only an unreachable Deluge is a failure.
+        return EXIT_FAILURE if stats.get("connection_failed") else EXIT_OK
 
     if args.debug:
         logger.remove()
@@ -1656,7 +1688,7 @@ def main() -> None:
             test_body = (
                 "This is a test e-mail from Deluge Orphaned Files.\n\n" f"Timestamp: {datetime.now().isoformat(timespec='seconds')}\n" "If you received this, SMTP settings are working correctly."
             )
-            send_scan_report(
+            sent = send_scan_report(
                 smtp_host=config.smtp_host,
                 smtp_port=config.smtp_port,
                 username=config.smtp_username,
@@ -1666,9 +1698,9 @@ def main() -> None:
                 report_body=test_body,
                 use_ssl=config.smtp_use_ssl,
             )
-        else:
-            logger.error("Cannot send test e-mail: incomplete SMTP configuration (check SMTP_* env vars).")
-        return
+            return EXIT_OK if sent else EXIT_FAILURE
+        logger.error("Cannot send test e-mail: incomplete SMTP configuration (check SMTP_* env vars).")
+        return EXIT_USAGE
 
     # Telegram test
     if args.test_telegram:
@@ -1676,40 +1708,40 @@ def main() -> None:
             test_body = (
                 "*Deluge Orphaned Files* – Telegram test message\n\n" f"Timestamp: {datetime.now().isoformat(timespec='seconds')}\n" "If you received this, Telegram settings are working correctly."
             )
-            send_telegram_report(
+            sent = send_telegram_report(
                 bot_token=config.telegram_bot_token,
                 chat_id=config.telegram_chat_id,
                 report_body=test_body,
             )
-        else:
-            logger.error("Cannot send test Telegram message: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured.")
-        return
+            return EXIT_OK if sent else EXIT_FAILURE
+        logger.error("Cannot send test Telegram message: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured.")
+        return EXIT_USAGE
 
     if args.show_last or args.scan_id is not None:
         if not args.sqlite:
             logger.error("Cannot show scan results without --sqlite flag, as data is in the database.")
-            return
+            return EXIT_USAGE
         if not os.path.exists(str(config.sqlite_cache_path)):
             logger.error(f"SQLite database not found at {str(config.sqlite_cache_path)}")
-            return
+            return EXIT_USAGE
         results = get_formatted_scan_results(args.scan_id if args.scan_id is not None else None)
         print(results)
-        return
+        return EXIT_OK
 
     if args.list_scans:
         if not args.sqlite:
             logger.error("Cannot list scans without --sqlite flag, as data is in the database.")
-            return
+            return EXIT_USAGE
         if not os.path.exists(str(config.sqlite_cache_path)):
             logger.error(f"SQLite database not found at {str(config.sqlite_cache_path)}")
-            return
+            return EXIT_USAGE
         history = list_scan_history(args.limit)
         print(history)
-        return
+        return EXIT_OK
 
     if args.migrate_to_sqlite:
         migrate_json_to_sqlite(no_progress=args.no_progress)
-        return
+        return EXIT_OK
 
     if args.clean_cache:
         if not args.sqlite:
@@ -1720,10 +1752,12 @@ def main() -> None:
             logger.info("Cleaning SQLite hash cache...")
             if not os.path.exists(str(config.sqlite_cache_path)):
                 logger.error(f"SQLite database not found at {str(config.sqlite_cache_path)} for cache cleaning.")
-                return
+                return EXIT_USAGE
             clean_hash_cache(config.local_torrent_base_local_folder, use_sqlite=True)
             clean_hash_cache(config.local_media_base_local_folder, use_sqlite=True)
-        return
+        return EXIT_OK
+
+    partial_failure = False
 
     # Run the scan using the storage mode chosen by the user (--sqlite flag)
     try:
@@ -1737,7 +1771,16 @@ def main() -> None:
         # The --use-inodes same-filesystem preflight carries its own remediation message;
         # exit cleanly instead of dumping a traceback.
         logger.error("{}", exc)
-        sys.exit(1)
+        return EXIT_FAILURE
+    except Exception:
+        logger.exception("Scan failed; aborting before labeling/deletion.")
+        return EXIT_FAILURE
+
+    if args.sqlite and scan_id <= 0:
+        # find_orphaned_files reports a failed DB save as scan_id 0; acting on
+        # stale state (labels, deletions) after a failed save would be wrong.
+        logger.error("Scan results could not be saved to the database; aborting before labeling/deletion.")
+        return EXIT_FAILURE
 
     # Handle auto-remove labels or pending actions if requested
     if args.apply_autoremove_labels:
@@ -1769,30 +1812,39 @@ def main() -> None:
             deluge_client.connect()
             if deluge_client.connected:
                 logger.debug("Successfully connected to Deluge for labeling.")
-                process_autoremove_labeling(
+                # Labeling swallows its own exceptions and reports them in the
+                # returned stats; surface them as a partial failure.
+                labeling_stats = process_autoremove_labeling(
                     client=deluge_client,
                     scan_id=scan_id,
                     db_path=config.sqlite_cache_path,
                     dry_run=not args.apply_autoremove_labels,
                     target_label_prefix=config.deluge_autoremove_label,
                 )
+                if (labeling_stats or {}).get("errors"):
+                    partial_failure = True
 
                 # Execute pending actions if requested
                 if args.execute_pending_actions:
-                    execute_pending_actions(
+                    _, pending_failed, _ = execute_pending_actions(
                         db_path=config.sqlite_cache_path,
                         client=deluge_client,
                         dry_run=not args.force,
                     )
+                    if pending_failed:
+                        partial_failure = True
                     if not args.force:
                         logger.info("Pending actions were only processed in dry-run mode. Use --force to actually apply changes.")
 
             else:
                 logger.error(f"Failed to connect to Deluge for labeling. Skipping '{config.deluge_autoremove_label}' labeling.")
+                partial_failure = True
         except ConnectionRefusedError:
             logger.error(f"Deluge connection refused at {config.deluge_host}:{config.deluge_port}. Skipping '{config.deluge_autoremove_label}' labeling. Ensure Deluge is running and accessible.")
+            partial_failure = True
         except Exception as e:
             logger.error(f"An error occurred during '{config.deluge_autoremove_label}' labeling: {e}. Skipping.")
+            partial_failure = True
         finally:
             if deluge_client and deluge_client.connected:
                 deluge_client.disconnect()
@@ -1814,7 +1866,8 @@ def main() -> None:
         logger.info(f"Scan results saved to {config.output_file}")
         logger.info("Deletion processing (--force) is only available with --sqlite mode.")
 
-    _dispatch_notifications(scan_id=scan_id, no_notify=args.no_notify)
+    if not _dispatch_notifications(scan_id=scan_id, no_notify=args.no_notify):
+        partial_failure = True
 
     # Only show the formatted table from the database when using SQLite mode
     if scan_id > 0:
@@ -1824,6 +1877,11 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to generate console summary table: {}", exc)
 
+    if partial_failure:
+        logger.warning("Run completed with partial failures; exiting with code {} (partial).", EXIT_PARTIAL)
+        return EXIT_PARTIAL
+    return EXIT_OK
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
