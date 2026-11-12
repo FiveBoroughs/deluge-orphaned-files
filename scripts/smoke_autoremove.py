@@ -10,7 +10,6 @@ actions for clone torrents.
 
 from __future__ import annotations
 
-import os
 import sys
 import sqlite3
 from pathlib import Path
@@ -96,11 +95,7 @@ class FakeDelugeClient:
 def main() -> int:
     # Ensure package root is importable when running from scripts/
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    # Configure environment for the package to load
-    os.environ.setdefault("DOF_RELABEL_ACTION_DELAY_DAYS", "3")
-    os.environ.setdefault("DOF_DELUGE_AUTOREMOVE_LABEL", "autoremove")
 
-    # Import after env vars set so settings picks them up
     from deluge_orphaned_files.logic.autoremove import process_autoremove_labeling
     from deluge_orphaned_files.logic.pending_actions import init_pending_actions_schema
 
@@ -121,6 +116,7 @@ def main() -> int:
         db_path=db_path,
         dry_run=True,
         target_label_prefix="autoremove",
+        relabel_delay_days=3,
     )
 
     print("SMOKE_STATS_DRY:", stats_dry)
@@ -137,6 +133,7 @@ def main() -> int:
         db_path=db_path,
         dry_run=False,
         target_label_prefix="autoremove",
+        relabel_delay_days=3,
     )
 
     with sqlite3.connect(str(db_path)) as conn:

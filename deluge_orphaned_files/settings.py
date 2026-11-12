@@ -1,14 +1,16 @@
 """Centralised application settings.
 
-Defines the AppConfig Pydantic model and instantiates a config object
-from environment variables. Import config wherever configuration values
-are needed.
+Defines the AppConfig Pydantic model. Nothing is instantiated at import
+time: callers obtain a validated instance via load_config() (the CLI does
+so once, in main()) and pass it explicitly to whatever needs it. Importing
+this module therefore never reads the environment, validates paths, or
+creates directories.
 
 Classes:
     AppConfig: Pydantic settings model for application configuration.
 
-Variables:
-    config: Global application configuration instance.
+Functions:
+    load_config: Build and validate an AppConfig from the environment.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-__all__ = ["AppConfig", "config"]
+__all__ = ["AppConfig", "load_config"]
 
 
 class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarations
@@ -219,16 +221,25 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
 
 
 # -------------------------------------------------------------------------
-# Instantiate config
+# Loading
 # -------------------------------------------------------------------------
-try:
-    config = AppConfig()
+def load_config() -> AppConfig:
+    """Build and validate an AppConfig from environment variables / .env.
+
+    On validation failure each field error is logged before re-raising, so
+    operators see *which* variables are wrong without a raw traceback.
+
+    Raises:
+        pydantic.ValidationError: If required settings are missing/invalid.
+    """
+    try:
+        cfg = AppConfig()
+    except ValidationError as exc:  # noqa: BLE001
+        logger.error("!!! Configuration Error !!!")
+        for detail in exc.errors():
+            variable_name = detail.get("loc", ["Unknown"])[0]
+            message = detail.get("msg", "Unknown error")
+            logger.error("  {}: {}", variable_name, message)
+        raise
     logger.info("Configuration loaded successfully from environment.")
-except ValidationError as exc:  # noqa: BLE001
-    logger.error("!!! Configuration Error !!!")
-    for detail in exc.errors():
-        variable_name = detail.get("loc", ["Unknown"])[0]
-        message = detail.get("msg", "Unknown error")
-        logger.error("  %s: %s", variable_name, message)
-    # Re-raise the exception to allow the calling code to handle it
-    raise
+    return cfg

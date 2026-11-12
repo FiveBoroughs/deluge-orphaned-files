@@ -17,7 +17,6 @@ from loguru import logger
 if TYPE_CHECKING:  # pragma: no cover
     from deluge_client import DelugeRPCClient
 
-from ..settings import config
 from .pending_actions import register_pending_action, ActionType
 
 __all__ = ["process_autoremove_labeling"]
@@ -27,8 +26,9 @@ def process_autoremove_labeling(
     client: "DelugeRPCClient",
     scan_id: int,
     db_path: str | Path,
+    target_label_prefix: str,
+    relabel_delay_days: int,
     dry_run: bool = True,
-    target_label_prefix: str = None,
 ) -> Dict[str, Any]:
     """Process auto-remove labeling with cross-seed coordination.
 
@@ -41,7 +41,8 @@ def process_autoremove_labeling(
         scan_id: ID of the scan to process.
         db_path: Path to the SQLite database.
         dry_run: If True, only log what would be done without making changes.
-        target_label_prefix: Label to apply (defaults to config.deluge_autoremove_label).
+        target_label_prefix: Label to apply (config.deluge_autoremove_label; explicit — this module reads no global config).
+        relabel_delay_days: Days a registered relabel action waits before execution (config.relabel_action_delay_days).
 
     Returns:
         Dictionary containing statistics about the labeling operation.
@@ -51,8 +52,6 @@ def process_autoremove_labeling(
         Exception: If there's an error communicating with Deluge.
     """
     db_path = Path(db_path)
-    if target_label_prefix is None:
-        target_label_prefix = config.deluge_autoremove_label
 
     stats = {
         "torrents_processed": 0,
@@ -112,6 +111,7 @@ def process_autoremove_labeling(
                     db_path=db_path,
                     torrent=torrent,
                     target_label_prefix=target_label_prefix,
+                    relabel_delay_days=relabel_delay_days,
                     scan_id=scan_id,
                     dry_run=dry_run,
                     is_cross_seed_group=has_cross_seeds,
@@ -368,6 +368,7 @@ def _process_single_torrent_for_labeling(
     db_path: Path,
     torrent: Dict[str, Any],
     target_label_prefix: str,
+    relabel_delay_days: int,
     scan_id: int,
     dry_run: bool,
     is_cross_seed_group: bool,
@@ -456,7 +457,7 @@ def _process_single_torrent_for_labeling(
                 db_path=db_path,
                 file_path=file_path,
                 action_type=ActionType.RELABEL,
-                waiting_period_days=config.relabel_action_delay_days,
+                waiting_period_days=relabel_delay_days,
                 action_params=action_params,
                 scan_id=str(scan_id),
                 orphaned_file_id=file_id,
@@ -507,7 +508,7 @@ def _process_single_torrent_for_labeling(
                 db_path=db_path,
                 file_path=file_path,
                 action_type=ActionType.RELABEL,
-                waiting_period_days=config.relabel_action_delay_days,
+                waiting_period_days=relabel_delay_days,
                 action_params=action_params,
                 scan_id=str(scan_id),
                 orphaned_file_id=None,

@@ -14,9 +14,11 @@ if TYPE_CHECKING:  # pragma: no cover
 import argparse
 import sqlite3
 from loguru import logger
+from pydantic import ValidationError
 
 from typing import List, Dict, Any, Tuple
 
+from .settings import AppConfig, load_config
 from .scanning.file_scanner import (
     load_hash_cache,
     save_hash_cache,
@@ -37,70 +39,45 @@ from .notifications.telegram_notifier import send_scan_report as send_telegram_r
 from . import __version__
 
 # ---------------------------------------------------------------------------
-# Configure Loguru – log to console and to config/logs/deluge_orphaned_files.log
-# ---------------------------------------------------------------------------
-# Early --list-env handling (dump AppConfig values)
-# ---------------------------------------------------------------------------
-if "--list-env" in sys.argv:
-    try:
-        from .settings import config as _cfg  # Local import to build AppConfig
-
-        masked: dict[str, str] = {}
-        for key, value in _cfg.model_dump(mode="python", exclude_defaults=False).items():
-            if value is None:
-                display = "NOT SET"
-            elif any(s in key.lower() for s in ("password", "token", "secret")):
-                display = "***"
-            else:
-                display = str(value)
-            masked[key] = display
-        print("\nLoaded configuration (masked):")
-        print(json.dumps(masked, indent=2))
-    except Exception as exc:  # noqa: BLE001
-        print("Failed to load AppConfig – validation errors below:\n")
-        print(exc)
-    sys.exit(0)
-
-# ---------------------------------------------------------------------------
-# Misc helper
-# ---------------------------------------------------------------------------
-# Allow override via environment variable; fallback to ./config/logs inside the
-# project (works both in Docker and local checkout)
-log_dir_env = os.getenv("APP_LOG_DIR")
-if log_dir_env:
-    log_dir = Path(log_dir_env)
-else:
-    # project_root = Path(__file__).resolve().parents[1]
-    log_dir = Path(__file__).resolve().parents[1] / "config" / "logs"
-
-# Ensure directory exists
-log_dir.mkdir(parents=True, exist_ok=True)
-
-log_file_path = log_dir / "deluge_orphaned_files.log"
-
-logger.remove()  # Remove default stderr logger (Loguru default)
-logger.add(
-    sys.stdout,
-    level="INFO",
-    format=("<green>{time:YYYY-MM-DD HH:mm:ss}</green> | " "<level>{level: <8}</level> | " "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - " "<level>{message}</level>"),
-)
-logger.add(
-    log_file_path,
-    rotation="1 day",
-    retention="30 days",
-    level="DEBUG",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-)
-
-logger.info("Logging initialized. Log file: {}", log_file_path)
-
-
-# ---------------------------------------------------------------------------
-# Misc helper
+# Logging setup — called from main(); importing this module has no side
+# effects (no config load, no directory creation, no sink installation), so
+# --help and test collection work without a valid configuration.
 # ---------------------------------------------------------------------------
 
-# Ensure users see path of log file at startup
-# (Already logged above; removed duplicate)
+
+def _configure_logging(*, debug: bool = False, trace: bool = False) -> Path:
+    """Configure Loguru console + rotating file sinks; return the log file path.
+
+    The log directory is APP_LOG_DIR when set, else ./config/logs inside the
+    project (works both in Docker and local checkout).
+    """
+    log_dir_env = os.getenv("APP_LOG_DIR")
+    if log_dir_env:
+        log_dir = Path(log_dir_env)
+    else:
+        log_dir = Path(__file__).resolve().parents[1] / "config" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file_path = log_dir / "deluge_orphaned_files.log"
+    console_level = "TRACE" if trace else "DEBUG" if debug else "INFO"
+    file_level = "TRACE" if trace else "DEBUG"
+
+    logger.remove()  # Remove default stderr logger (Loguru default)
+    logger.add(
+        sys.stdout,
+        level=console_level,
+        format=("<green>{time:YYYY-MM-DD HH:mm:ss}</green> | " "<level>{level: <8}</level> | " "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - " "<level>{message}</level>"),
+    )
+    logger.add(
+        log_file_path,
+        rotation="1 day",
+        retention="30 days",
+        level=file_level,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+    )
+
+    logger.info("Logging initialized. Log file: {}", log_file_path)
+    return log_file_path
 
 
 def print_version_info() -> None:
@@ -111,7 +88,7 @@ def print_version_info() -> None:
     logger.info("Deluge Orphaned Files v{}", __version__)
 
 
-def print_loaded_env_vars(cfg: "AppConfig") -> None:  # noqa: F821 – forward ref for type checkers
+def print_loaded_env_vars(cfg: AppConfig) -> None:
     """Pretty-print the environment variables that populated *cfg*.
 
     Sensitive values like passwords or tokens are masked. Fields that are ``None``
@@ -131,19 +108,7 @@ def print_loaded_env_vars(cfg: "AppConfig") -> None:  # noqa: F821 – forward r
     print(json.dumps(masked, indent=2))
 
 
-# ---------------------------------------------------------------------------
-# Global configuration (shared across all modules)
-# ---------------------------------------------------------------------------
-
-# NOTE: The canonical AppConfig and the *singleton* "config" object now live
-# in :pymod:`deluge_orphaned_files.settings`.  Importing it here ensures we
-# share the exact same instance everywhere (including sub-modules executed
-# earlier via their own imports).
-
-from .settings import AppConfig, config  # noqa: E402  – import after logger setup for readable init logs
-
-
-def init_sqlite_cache(db_path: Path) -> None:
+def init_sqlite_cache(db_path: Path, *, config: AppConfig) -> None:
     """Initialize the SQLite cache database.
 
     Creates the database file if it doesn't exist and creates the necessary tables if they don't exist.
@@ -432,7 +397,7 @@ def _convert_legacy_consecutive_scans(db_path: Path) -> None:
         logger.error(f"SQLite error converting legacy consecutive_scans in {db_path}: {e}")
 
 
-def find_orphaned_files(skip_media_check: bool = False, use_sqlite: bool = False, no_progress: bool = False, use_inodes: bool = False) -> int:
+def find_orphaned_files(*, config: AppConfig, skip_media_check: bool = False, use_sqlite: bool = False, no_progress: bool = False, use_inodes: bool = False) -> int:
     """Find orphaned files by comparing Deluge files with local torrent and media folders.
 
     Scans local folders and Deluge client to identify orphaned files in three categories:
@@ -480,10 +445,10 @@ def find_orphaned_files(skip_media_check: bool = False, use_sqlite: bool = False
     )
 
     if use_sqlite:
-        scan_id_from_db, _ = save_scan_results_to_db(orphaned_torrent_files, only_in_torrents, only_in_media, scan_start_time)
+        scan_id_from_db, _ = save_scan_results_to_db(orphaned_torrent_files, only_in_torrents, only_in_media, scan_start_time, config=config)
         return scan_id_from_db
     else:
-        save_scan_results(orphaned_torrent_files, only_in_torrents, only_in_media, scan_start_time)
+        save_scan_results(orphaned_torrent_files, only_in_torrents, only_in_media, scan_start_time, config=config)
         # scan_id remains 0 if not use_sqlite (as initialized at the start of the function)
         return scan_id
 
@@ -493,6 +458,8 @@ def save_scan_results_to_db(
     only_in_torrents: List[Dict[str, Any]],
     only_in_media: List[Dict[str, Any]],
     scan_start_time: datetime,
+    *,
+    config: AppConfig,
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """
     Save scan results to the SQLite database.
@@ -941,7 +908,7 @@ def save_scan_results_to_db(
     return scan_id, only_in_torrents
 
 
-def get_formatted_scan_results(scan_id=None, limit=1):
+def get_formatted_scan_results(scan_id=None, limit=1, *, config: AppConfig):
     """
     Get formatted scan results from the database.
 
@@ -1048,6 +1015,8 @@ def save_scan_results(
     only_in_torrents: List[Dict[str, Any]],
     only_in_media: List[Dict[str, Any]],
     scan_start_time: datetime = None,
+    *,
+    config: AppConfig,
 ) -> None:
     """
     Save scan results to JSON file and optionally to the database.
@@ -1083,7 +1052,7 @@ def save_scan_results(
         logger.error(f"Failed to save scan results to {config.output_file}: {e}")
 
 
-def clean_hash_cache(folder: Path, use_sqlite=False) -> None:
+def clean_hash_cache(folder: Path, use_sqlite=False, *, config: AppConfig) -> None:
     """
     Clean stale entries from the cache for files that no longer exist.
 
@@ -1164,7 +1133,7 @@ def clean_hash_cache(folder: Path, use_sqlite=False) -> None:
             logger.info(f"No stale entries found in JSON hash cache for {folder}")
 
 
-def migrate_json_to_sqlite(no_progress: bool = False):
+def migrate_json_to_sqlite(no_progress: bool = False, *, config: AppConfig):
     """
     Migrate data from JSON hash caches to the SQLite database.
     Reads the JSON hash caches from both the torrent and media folders
@@ -1173,7 +1142,7 @@ def migrate_json_to_sqlite(no_progress: bool = False):
     logger.info("Starting migration of JSON hash caches to SQLite database...")
 
     # Initialize the SQLite database
-    init_sqlite_cache(str(config.sqlite_cache_path))  # Initialize full database schema
+    init_sqlite_cache(str(config.sqlite_cache_path), config=config)  # Initialize full database schema
 
     folders_to_migrate = [
         (config.local_torrent_base_local_folder, "torrent folder"),
@@ -1248,7 +1217,7 @@ def migrate_json_to_sqlite(no_progress: bool = False):
     logger.info(f"Migration complete. Total entries migrated: {total_migrated}")
 
 
-def list_scan_history(limit=10):
+def list_scan_history(limit=10, *, config: AppConfig):
     """
     List the scan history from the database.
 
@@ -1427,7 +1396,7 @@ EXIT_USAGE = 2  # cannot run as asked (flag combination / missing configuration)
 EXIT_PARTIAL = 3  # primary work saved, but a secondary step (labeling, notification) failed
 
 
-def _dispatch_notifications(*, scan_id: int, no_notify: bool) -> bool:
+def _dispatch_notifications(*, config: AppConfig, scan_id: int, no_notify: bool) -> bool:
     """Send the scan report via e-mail and/or Telegram, unless suppressed.
 
     ``--no-notify`` (appended by the scheduler for startup runs) silences both
@@ -1496,8 +1465,6 @@ def main() -> int:
         Process exit code: EXIT_OK (0), EXIT_FAILURE (1), EXIT_USAGE (2), or
         EXIT_PARTIAL (3) when the scan was saved but labeling/notifications failed.
     """
-    print_version_info()
-
     # Create parser with description and version info
     parser = argparse.ArgumentParser(
         description="Deluge Orphaned Files - Find and manage orphaned torrent files",
@@ -1575,7 +1542,7 @@ def main() -> int:
     file_group.add_argument(
         "--apply-autoremove-labels",
         action="store_true",
-        help=f"Apply '{config.deluge_autoremove_label}' label in Deluge to torrents found only on torrent disk " "(not in media) and not already labeled as such. Performs a dry run if not specified.",
+        help="Apply the DELUGE_AUTOREMOVE_LABEL label in Deluge to torrents found only on torrent disk (not in media) and not already labeled as such. Performs a dry run if not specified.",
     )
     file_group.add_argument(
         "--execute-pending-actions",
@@ -1627,6 +1594,16 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    _configure_logging(debug=args.debug, trace=args.trace)
+    print_version_info()
+
+    # The one place configuration is loaded; everything below receives it
+    # explicitly. Field-level errors were already logged by load_config().
+    try:
+        config = load_config()
+    except ValidationError:
+        return EXIT_USAGE
+
     # Early-exit helper flags -------------------------------------------------
     if args.list_env:
         print_loaded_env_vars(config)
@@ -1637,37 +1614,6 @@ def main() -> int:
         # Designed skips (lock held by another run, low free space) are still a
         # completed invocation; only an unreachable Deluge is a failure.
         return EXIT_FAILURE if stats.get("connection_failed") else EXIT_OK
-
-    if args.debug:
-        logger.remove()
-        logger.add(
-            sys.stdout,
-            level="DEBUG",
-            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        )
-        logger.add(
-            log_file_path,
-            rotation="1 day",
-            retention="30 days",
-            level="DEBUG",
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-        )
-        logger.debug("Debug logging enabled.")
-    if args.trace:
-        logger.remove()
-        logger.add(
-            sys.stdout,
-            level="TRACE",
-            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        )
-        logger.add(
-            log_file_path,
-            rotation="1 day",
-            retention="30 days",
-            level="TRACE",
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-        )
-        logger.trace("Trace logging enabled.")
 
     # Record the flags and thresholds in effect so a log file read months later is
     # self-describing and does not require guessing how the run was invoked.
@@ -1680,7 +1626,7 @@ def main() -> int:
 
     if args.sqlite:
         logger.debug(f"Initializing SQLite database schema at {config.sqlite_cache_path}")
-        init_sqlite_cache(str(config.sqlite_cache_path))  # Initialize full database schema
+        init_sqlite_cache(str(config.sqlite_cache_path), config=config)  # Initialize full database schema
 
     # Email test
     if args.test_email:
@@ -1724,7 +1670,7 @@ def main() -> int:
         if not os.path.exists(str(config.sqlite_cache_path)):
             logger.error(f"SQLite database not found at {str(config.sqlite_cache_path)}")
             return EXIT_USAGE
-        results = get_formatted_scan_results(args.scan_id if args.scan_id is not None else None)
+        results = get_formatted_scan_results(args.scan_id if args.scan_id is not None else None, config=config)
         print(results)
         return EXIT_OK
 
@@ -1735,26 +1681,26 @@ def main() -> int:
         if not os.path.exists(str(config.sqlite_cache_path)):
             logger.error(f"SQLite database not found at {str(config.sqlite_cache_path)}")
             return EXIT_USAGE
-        history = list_scan_history(args.limit)
+        history = list_scan_history(args.limit, config=config)
         print(history)
         return EXIT_OK
 
     if args.migrate_to_sqlite:
-        migrate_json_to_sqlite(no_progress=args.no_progress)
+        migrate_json_to_sqlite(no_progress=args.no_progress, config=config)
         return EXIT_OK
 
     if args.clean_cache:
         if not args.sqlite:
             logger.info("Cleaning JSON hash cache...")
-            clean_hash_cache(config.local_torrent_base_local_folder, use_sqlite=False)
-            clean_hash_cache(config.local_media_base_local_folder, use_sqlite=False)
+            clean_hash_cache(config.local_torrent_base_local_folder, use_sqlite=False, config=config)
+            clean_hash_cache(config.local_media_base_local_folder, use_sqlite=False, config=config)
         else:
             logger.info("Cleaning SQLite hash cache...")
             if not os.path.exists(str(config.sqlite_cache_path)):
                 logger.error(f"SQLite database not found at {str(config.sqlite_cache_path)} for cache cleaning.")
                 return EXIT_USAGE
-            clean_hash_cache(config.local_torrent_base_local_folder, use_sqlite=True)
-            clean_hash_cache(config.local_media_base_local_folder, use_sqlite=True)
+            clean_hash_cache(config.local_torrent_base_local_folder, use_sqlite=True, config=config)
+            clean_hash_cache(config.local_media_base_local_folder, use_sqlite=True, config=config)
         return EXIT_OK
 
     partial_failure = False
@@ -1762,6 +1708,7 @@ def main() -> int:
     # Run the scan using the storage mode chosen by the user (--sqlite flag)
     try:
         scan_id = find_orphaned_files(
+            config=config,
             skip_media_check=args.skip_media_check,
             use_sqlite=args.sqlite,
             no_progress=args.no_progress,
@@ -1820,6 +1767,7 @@ def main() -> int:
                     db_path=config.sqlite_cache_path,
                     dry_run=not args.apply_autoremove_labels,
                     target_label_prefix=config.deluge_autoremove_label,
+                    relabel_delay_days=config.relabel_action_delay_days,
                 )
                 if (labeling_stats or {}).get("errors"):
                     partial_failure = True
@@ -1866,7 +1814,7 @@ def main() -> int:
         logger.info(f"Scan results saved to {config.output_file}")
         logger.info("Deletion processing (--force) is only available with --sqlite mode.")
 
-    if not _dispatch_notifications(scan_id=scan_id, no_notify=args.no_notify):
+    if not _dispatch_notifications(config=config, scan_id=scan_id, no_notify=args.no_notify):
         partial_failure = True
 
     # Only show the formatted table from the database when using SQLite mode
