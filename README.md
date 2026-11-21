@@ -402,3 +402,9 @@ Common issues and solutions:
 2. **Connection refused**: Check Deluge daemon status
 3. **Slow performance**: Verify disk health and network connection
 4. **High memory usage**: Reduce batch size via `CACHE_SAVE_INTERVAL`
+
+## CI dependency updates
+
+GitHub Actions versions and their resolved commits are tracked in `.github/workflows/actions.lock`. Run `gh actions-lock` after editing workflow dependencies. Dependabot checks weekly and updates the lockfile in its PRs.
+
+CI runs the Python tests and builds and smoke-tests the Docker image on pull requests and pushes to `main`. On `main`, the publish job pushes the tested OCI image to GHCR under both `latest` and the commit SHA.

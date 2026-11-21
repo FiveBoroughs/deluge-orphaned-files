@@ -1,0 +1,27 @@
+# Default-deny: only the runtime build inputs enter the build context.
+*
+
+!Dockerfile
+!requirements.txt
+!deluge_orphaned_files/
+!deluge_orphaned_files/**
+
+# Re-exclude anything nested inside the allowed package (bytecode, caches,
+# local secrets/state, tests).
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.env
+**/.env.*
+**/*.env
+**/*.db
+**/*.sqlite*
+**/*.log
+**/*.pem
+**/*.key
+**/tests
+**/test_*.py
+**/*_test.py
+**/conftest.py

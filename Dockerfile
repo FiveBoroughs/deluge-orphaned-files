@@ -20,8 +20,6 @@ RUN python -m pip install --upgrade pip && pip install -r requirements.txt
 
 # --- Application source ------------------------------------------------------
 COPY deluge_orphaned_files ./deluge_orphaned_files
-# copy top-level scripts (if any) and metadata
-COPY *.py ./
 
 ARG VERSION=dev
 ARG REVISION=unknown
