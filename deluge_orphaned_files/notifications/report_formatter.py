@@ -123,6 +123,7 @@ def format_scan_results(db_path: Path, *, scan_id: Optional[int] = None, limit: 
                        action_details, action_due_at
                 FROM pending_actions
                 WHERE status = 'pending'
+                    AND proposed_action != 'remove_tracker_rejected'
                 ORDER BY action_due_at ASC;
                 """
             )

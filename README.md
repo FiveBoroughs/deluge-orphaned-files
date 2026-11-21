@@ -194,6 +194,23 @@ Runs never overlap; a run that overruns its slot skips the missed fire rather th
 
 **Migrating from an external cron/start-on-schedule setup** (e.g. TrueNAS cron job starting the container): set `CRON_SCHEDULE`, change the app restart policy to *unless-stopped*, and remove the external cron job.
 
+### Queueing tracker-rejected registrations for removal
+
+Tracker cleanup is opt-in and runs on its own, without an orphan scan or any file deletion:
+
+```bash
+python -m deluge_orphaned_files.cli --tracker-rejected-torrents         # preview only
+python -m deluge_orphaned_files.cli --apply-tracker-rejected-removals   # queue and process due actions
+```
+
+The command uses `APP_SQLITE_CACHE_PATH` (no `--sqlite` flag needed) and the existing queue grace period, `RELABEL_ACTION_DELAY_DAYS` (default 7 days). It queues complete private torrents in Deluge's `Seeding` state only when `tracker_status` is exactly `Unregistered torrent`, `Torrent removed by its uploader`, or `Torrent has been deleted.` after stripping Deluge's optional `Error:` prefix, surrounding whitespace and case differences. Completion uses Deluge's `is_seed` flag, not just 100% of wanted files. One matching reply is enough even if multiple announce URLs are configured; cooldowns, warnings, authentication and network errors, and unknown replies are not terminal.
+
+Re-running the command does not restart the grace period: the queue keeps one pending action per infohash for the configured Deluge host and port. Once due, the command reads fresh status from Deluge. `Announce OK` or known ineligibility cancels the action; temporary, unknown, or unverifiable status leaves it pending. A still-eligible torrent with an exact terminal reply is removed **from Deluge only** (`remove_data=False`), without applying `othercat` or touching its local data. Logs show the matched reply, due time and outcome, but never the announce URL or credentials.
+
+The preview shows new and existing due times and what would happen to due actions, without changing the queue or Deluge. Schedule the apply command as a **separate invocation** from the normal orphan scan (for example, a separate scheduled container execution). It does not require `--force`, and normal `--execute-pending-actions` does not process tracker removals.
+Use one apply schedule per daemon and queue. Do not start a manual apply while
+that scheduled run is active.
+
 ### Repairing stuck cross-seed torrents
 
 cross-seed injects partial matches paused and only resumes them when little is missing, so some torrents sit paused-incomplete forever even though every missing file already exists on disk, verified complete in another torrent. Two standalone flags (no scan) find and fix those:
