@@ -17,6 +17,8 @@ from __future__ import annotations
 import datetime
 import json
 import sqlite3
+from contextlib import closing
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -41,6 +43,18 @@ class ActionType(Enum):
     RELABEL = auto()  # Apply othercat label
     MANUAL_REVIEW = auto()  # Require manual review
     UNKNOWN = auto()  # Unknown / unsupported action type
+    REMOVE_TRACKER_REJECTED = auto()  # Remove a Deluge registration, keeping the data
+
+
+_TRACKER_REMOVAL = ActionType.REMOVE_TRACKER_REJECTED.name.lower()
+
+
+@dataclass(frozen=True)
+class PendingTrackerRemoval:
+    id: int | None  # None for a dry-run candidate that isn't in the queue
+    torrent_hash: str
+    reply: str
+    due_at: str
 
 
 def init_pending_actions_schema(db_path: str | Path) -> None:
@@ -123,6 +137,11 @@ def init_pending_actions_schema(db_path: str | Path) -> None:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_action_due_at ON pending_actions (action_due_at);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_orphaned_file_id ON pending_actions (orphaned_file_id);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_actions_scan_id_identified ON pending_actions (scan_id_identified);")
+            cursor.execute(
+                f"""CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_tracker_removals
+                ON pending_actions (source, torrent_id)
+                WHERE proposed_action = '{_TRACKER_REMOVAL}' AND status = 'pending'"""
+            )
 
             conn.commit()
             logger.debug("Pending actions schema initialized successfully")
@@ -133,6 +152,63 @@ def init_pending_actions_schema(db_path: str | Path) -> None:
     except Exception as e:
         logger.error("Unexpected error initializing pending actions schema: {}", e)
         raise
+
+
+def get_pending_tracker_removals(db_path: Path, daemon_key: str) -> dict[str, PendingTrackerRemoval]:
+    """Read tracker removal rows without creating or migrating the queue."""
+    if not db_path.exists():
+        return {}
+    with closing(sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+        if not conn.execute("SELECT 1 FROM pragma_table_info('pending_actions') WHERE name = 'source'").fetchone():
+            return {}
+        rows = conn.execute(
+            """SELECT id, torrent_id, action_details, action_due_at FROM pending_actions
+            WHERE source = ? AND proposed_action = ? AND status = 'pending' ORDER BY action_due_at, id""",
+            (daemon_key, _TRACKER_REMOVAL),
+        )
+        return {row[1]: PendingTrackerRemoval(*row) for row in rows}
+
+
+def register_tracker_removal(
+    db_path: Path,
+    daemon_key: str,
+    torrent_hash: str,
+    reply: str,
+    due_at: str,
+) -> PendingTrackerRemoval:
+    """Queue a tracker rejection once per hash, retaining the initial reply and due date."""
+    with sqlite3.connect(db_path) as conn:
+        # The legacy queue requires a path and scan ID; this action identifies
+        # only a registration and does not belong to a filesystem scan.
+        conn.execute(
+            f"""INSERT INTO pending_actions
+            (source, torrent_id, file_path, proposed_action, action_details, size_human, scan_id_identified, action_due_at)
+            VALUES (?, ?, ?, ?, ?, 'Unknown', 0, ?)
+            ON CONFLICT (source, torrent_id)
+            WHERE proposed_action = '{_TRACKER_REMOVAL}' AND status = 'pending' DO NOTHING""",
+            (daemon_key, torrent_hash, torrent_hash, _TRACKER_REMOVAL, reply, due_at),
+        )
+        row = conn.execute(
+            """SELECT id, torrent_id, action_details, action_due_at FROM pending_actions
+            WHERE source = ? AND torrent_id = ? AND proposed_action = ? AND status = 'pending'""",
+            (daemon_key, torrent_hash, _TRACKER_REMOVAL),
+        ).fetchone()
+        return PendingTrackerRemoval(*row)
+
+
+def record_tracker_removal_outcome(
+    db_path: Path,
+    action_id: int,
+    status: ActionStatus,
+    notes: str,
+    checked_at: str,
+) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """UPDATE pending_actions SET status = ?, processing_notes = ?, processed_at = ?
+            WHERE id = ? AND proposed_action = ? AND status = 'pending'""",
+            (status.name.lower(), notes, None if status is ActionStatus.PENDING else checked_at, action_id, _TRACKER_REMOVAL),
+        )
 
 
 def register_pending_action(
@@ -403,10 +479,10 @@ def get_actions_due_for_execution(db_path: str | Path) -> List[Dict[str, Any]]:
                        identified_at, action_due_at, status, scan_id_processed,
                        processed_at, processing_notes, source, file_size
                 FROM pending_actions
-                WHERE status = ? AND action_due_at <= ?
+                WHERE status = ? AND action_due_at <= ? AND proposed_action != ?
                 ORDER BY action_due_at
             """,
-                ("pending", now_str),
+                ("pending", now_str, _TRACKER_REMOVAL),
             )
 
             for row in cursor.fetchall():
@@ -571,6 +647,9 @@ def execute_pending_action(
     file_path = action.get("file_path")
     torrent_hash = action.get("torrent_hash")
     action_details = action.get("action_details")
+
+    if action_type is ActionType.REMOVE_TRACKER_REJECTED or proposed_action == _TRACKER_REMOVAL:
+        return False, "Tracker removals require the standalone tracker cleanup command"
 
     if not action_id or not file_path:
         return False, "Missing required action information"

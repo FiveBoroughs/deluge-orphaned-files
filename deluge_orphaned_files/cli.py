@@ -25,7 +25,9 @@ from .scanning.file_scanner import (
 )
 from .logic.orphan_finder import InodePreflightError, compute_orphans
 from .logic.autoremove import process_autoremove_labeling
+from .logic.missing_payloads import reconcile_missing_payloads
 from .logic.stuck_repair import run_stuck_repair
+from .logic.tracker_rejections import run_tracker_rejections
 from .logic.pending_actions import (
     init_pending_actions_schema,
     execute_pending_actions as execute_all_pending_actions,
@@ -1549,6 +1551,25 @@ def main() -> int:
         action="store_true",
         help="Execute pending actions that are due (e.g., apply deferred labels). Use with --force to actually apply changes.",
     )
+    file_group.add_argument(
+        "--reconcile-missing-payloads",
+        action="store_true",
+        help="Track Deluge torrents whose entire payload is missing (requires --sqlite). "
+        "With --execute-pending-actions this previews removal, or removes due registrations only if --force is also set.",
+    )
+
+    tracker_group = parser.add_argument_group("Tracker Registration Cleanup")
+    tracker_mode = tracker_group.add_mutually_exclusive_group()
+    tracker_mode.add_argument(
+        "--tracker-rejected-torrents",
+        action="store_true",
+        help="Standalone dry run: preview queuing and rechecking terminal tracker rejections without making changes.",
+    )
+    tracker_mode.add_argument(
+        "--apply-tracker-rejected-removals",
+        action="store_true",
+        help="Standalone: queue terminal tracker rejections and recheck due removals, keeping local data.",
+    )
 
     # Stuck cross-seed repair group (standalone; issue #1)
     repair_group = parser.add_argument_group("Stuck Torrent Repair")
@@ -1594,6 +1615,10 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    tracker_cleanup = args.tracker_rejected_torrents or args.apply_tracker_rejected_removals
+    if tracker_cleanup and (args.repair_stuck_torrents or args.apply_stuck_repairs):
+        parser.error("tracker registration cleanup and stuck torrent repair cannot run together")
+
     _configure_logging(debug=args.debug, trace=args.trace)
     print_version_info()
 
@@ -1614,6 +1639,16 @@ def main() -> int:
         # Designed skips (lock held by another run, low free space) are still a
         # completed invocation; only an unreachable Deluge is a failure.
         return EXIT_FAILURE if stats.get("connection_failed") else EXIT_OK
+
+    if args.reconcile_missing_payloads:
+        if not args.sqlite:
+            parser.error("--reconcile-missing-payloads requires --sqlite")
+        if not config.deluge_media_base_remote_folder:
+            logger.error("--reconcile-missing-payloads requires DELUGE_MEDIA_BASE_REMOTE_FOLDER")
+            return EXIT_USAGE
+
+    if tracker_cleanup:
+        return EXIT_OK if run_tracker_rejections(config, dry_run=not args.apply_tracker_rejected_removals) else EXIT_FAILURE
 
     # Record the flags and thresholds in effect so a log file read months later is
     # self-describing and does not require guessing how the run was invoked.
@@ -1759,6 +1794,13 @@ def main() -> int:
             deluge_client.connect()
             if deluge_client.connected:
                 logger.debug("Successfully connected to Deluge for labeling.")
+                if args.reconcile_missing_payloads:
+                    reconcile_missing_payloads(
+                        config,
+                        deluge_client,
+                        execute=args.execute_pending_actions,
+                        dry_run=args.execute_pending_actions and not args.force,
+                    )
                 # Labeling swallows its own exceptions and reports them in the
                 # returned stats; surface them as a partial failure.
                 labeling_stats = process_autoremove_labeling(

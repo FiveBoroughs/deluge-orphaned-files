@@ -201,15 +201,53 @@ The CLI exits with a meaningful code (also in `--help`):
 | Code | Meaning |
 |---|---|
 | 0 | Completed |
-| 1 | Failed (e.g. scan error, Deluge unreachable for stuck-torrent repair, test notification could not be sent) |
+| 1 | Failed (e.g. scan error, Deluge unreachable for stuck-torrent repair or tracker cleanup, test notification could not be sent) |
 | 2 | Usage/configuration error (the request cannot be served as asked, e.g. `--show-last` without `--sqlite`, test notification without its configuration) |
-| 3 | Partial: scan saved, but a secondary step (autoremove labeling, e-mail/Telegram report) failed |
+| 3 | Partial: scan saved, but a secondary step (autoremove labeling, pending actions, e-mail/Telegram report) failed |
 
 After every run the scheduler records the outcome (exit code, finish time, consecutive-failure streak) in a status file (`STATUS_PATH`, default `/tmp/delugeof-last-run.json`). The image HEALTHCHECK fails when the heartbeat is stale (>180s, scheduler stuck) **or** two consecutive runs have failed — so a nightly run that keeps erroring shows up as an unhealthy container instead of silently doing nothing. One transient failure does not trip it.
 
 > **Log rotation:** the container logs every run to stdout (JSON-file driver by default). Cap it, e.g. Docker Compose `logging: {driver: json-file, options: {max-size: "10m", max-file: "3"}}` or the equivalent in your orchestrator, so years of nightly runs don't grow unbounded.
 
 **Migrating from an external cron/start-on-schedule setup** (e.g. TrueNAS cron job starting the container): set `CRON_SCHEDULE`, change the app restart policy to *unless-stopped*, and remove the external cron job.
+
+### Retiring Deluge registrations with entirely missing payloads
+
+When a retention tool deletes media, Deluge can continue to report the affected torrents as seeding. `--reconcile-missing-payloads` adds a separate, opt-in inventory pass to the normal scan. It checks every Deluge infohash (including torrents sharing the same files), and never unlinks data.
+
+Set `DELUGE_MEDIA_BASE_REMOTE_FOLDER` to the absolute path Deluge uses for the media root, corresponding to `LOCAL_MEDIA_BASE_LOCAL_FOLDER`. The existing `DELUGE_TORRENT_BASE_REMOTE_FOLDER` and `LOCAL_TORRENT_BASE_LOCAL_FOLDER` settings map the torrent root. The two remote roots must not overlap. The pass checks locations in Deluge's file inventory, not similarly named files elsewhere. Use roots on the actual mounted storage, not parents of separate, nested mounts.
+
+Place a regular file named `.delugeof-root` at the top of **each** local root, on the intended storage while it is mounted (an empty file is enough). Do not put the marker in the underlying mountpoint; otherwise it cannot establish whether the storage is present. Both roots and markers must be accessible and are checked again before removal. An unreadable path, malformed or unmapped inventory, or failed RPC does not count as evidence of absence.
+
+```bash
+# Preview only: no candidate state changes and no registrations removed
+python -m deluge_orphaned_files.cli --sqlite --reconcile-missing-payloads --execute-pending-actions
+
+# Record observations over multiple runs without removing any registrations
+python -m deluge_orphaned_files.cli --sqlite --reconcile-missing-payloads
+
+# Retire due registrations. WARNING: --force also lets legacy pending actions delete orphan files.
+python -m deluge_orphaned_files.cli --sqlite --reconcile-missing-payloads --execute-pending-actions --force
+```
+
+An observation counts only if Deluge reports a complete seed (`Seeding` or a completed `Paused` seed) and every listed payload path is absent. A file that reappears or a move/re-add breaks the streak. Both `DELETION_CONSECUTIVE_SCANS_THRESHOLD` and `DELETION_DAYS_THRESHOLD` apply (default 7 observations and 7 days); even a threshold below two requires two separate successful observations. Before each removal the pass rechecks the individual torrent and all of its paths, then asks Deluge to remove that one registration with `remove_data=False`. These flags do not change how the legacy orphan-file workflow behaves; `--execute-pending-actions --force` still also executes legacy actions.
+
+### Queueing tracker-rejected registrations for removal
+
+Tracker cleanup is opt-in and runs on its own, without an orphan scan or any file deletion:
+
+```bash
+python -m deluge_orphaned_files.cli --tracker-rejected-torrents         # preview only
+python -m deluge_orphaned_files.cli --apply-tracker-rejected-removals   # queue and process due actions
+```
+
+The command uses `APP_SQLITE_CACHE_PATH` (no `--sqlite` flag needed) and the existing queue grace period, `RELABEL_ACTION_DELAY_DAYS` (default 7 days). It queues complete private torrents in Deluge's `Seeding` state only when `tracker_status` is exactly `Unregistered torrent`, `Torrent removed by its uploader`, or `Torrent has been deleted.` after stripping Deluge's optional `Error:` prefix, surrounding whitespace and case differences. Completion uses Deluge's `is_seed` flag, not just 100% of wanted files. One matching reply is enough even if multiple announce URLs are configured; cooldowns, warnings, authentication and network errors, and unknown replies are not terminal.
+
+Re-running the command does not restart the grace period: the queue keeps one pending action per infohash for the configured Deluge host and port. Once due, the command reads fresh status from Deluge. `Announce OK` or known ineligibility cancels the action; temporary, unknown, or unverifiable status leaves it pending. A still-eligible torrent with an exact terminal reply is removed **from Deluge only** (`remove_data=False`), without applying `othercat` or touching its local data. Logs show the matched reply, due time and outcome, but never the announce URL or credentials.
+
+The preview shows new and existing due times and what would happen to due actions, without changing the queue or Deluge. Schedule the apply command as a **separate invocation** from the normal orphan scan (for example, a separate scheduled container execution). It does not require `--force`, and normal `--execute-pending-actions` does not process tracker removals.
+Use one apply schedule per daemon and queue. Do not start a manual apply while
+that scheduled run is active.
 
 ### Repairing stuck cross-seed torrents
 
@@ -220,9 +258,93 @@ python -m deluge_orphaned_files.cli --repair-stuck-torrents   # dry-run: log pla
 python -m deluge_orphaned_files.cli --apply-stuck-repairs     # link, guarded recheck, resume what verifies
 ```
 
-Eligible torrents are paused, incomplete, labelled `cross-seed` or `*.cross-seed`, and added more than `REPAIR_MIN_AGE_HOURS` (24) ago. Each missing wanted file is matched to a verified donor by name+size — or by size alone when at least `REPAIR_SIZE_ONLY_MIN_MB` (50 MB) and unambiguous — then hardlinked into place. Destinations another torrent also uses are skipped, directories are never created, existing partials are kept as `*.delugeof-repair-bak` until verification passes, and repairs are all-or-nothing per torrent.
+Eligible torrents are paused, incomplete, labelled `cross-seed` or `*.cross-seed`, and added more than `REPAIR_MIN_AGE_HOURS` (24) ago. Each missing wanted file is matched to a verified donor by name+size — or by size alone when at least `REPAIR_SIZE_ONLY_MIN_MB` (50 MB) and unambiguous — then hardlinked into place. Repair uses regular files under the configured torrent base. A destination also used by another torrent, even through a directory alias, is skipped. Directories are never created, and existing partials are kept as `*.delugeof-repair-bak` without overwriting an existing backup.
 
-The verification recheck runs with all file priorities at 0, a `REPAIR_MAX_DOWNLOAD_SPEED_KIB` cap and auto-management off; if more than `REPAIR_DOWNLOAD_ABORT_MB` (1 MB) downloads anyway, the repair aborts. Torrents that verify 100% are resumed and their backups deleted; the rest get their original files restored plus a re-recheck, and are reported as still stuck (attempts tracked in `stuck-repair-state.json`). Nothing is ever removed. A run is skipped below `REPAIR_MIN_FREE_GB` (10 GB) free space, and a lock prevents overlapping runs. In scheduled (daemon) mode, add the flags to the container command as a separate scheduled invocation or run them manually with `docker exec`.
+The verification recheck runs with all file priorities at 0, a positive `REPAIR_MAX_DOWNLOAD_SPEED_KIB` cap and auto-management off. The repair aborts if more than `REPAIR_DOWNLOAD_ABORT_MB` (1 MB) downloads, if the payload counter is lost or reset, or if Deluge no longer reports the guard settings. Torrents that verify 100% are resumed, then their backups are deleted; a cleanup error leaves the verified links and reports the remaining backup. Failed repairs restore the original files and recheck them once Deluge confirms the torrent is paused. If a pause cannot be confirmed, the links, backups and guard settings are left in place for manual recovery.
+
+Still-stuck torrents are reported only (attempts tracked in `stuck-repair-state.json`); no torrents are removed. A run is skipped below `REPAIR_MIN_FREE_GB` (10 GB) free space, and a lock prevents overlapping runs. In scheduled (daemon) mode, add the flags to the container command as a separate scheduled invocation or run them manually with `docker exec`.
+
+#### Planning sidecar recovery (issue #3)
+
+When local hardlinks alone can't repair a variant, run the standalone v1 planner:
+
+```bash
+python -m deluge_orphaned_files.sidecar_plan \
+  --manifest /input/variants.json --metainfo-dir /input/metainfo
+# Optional: --torrent FULL_40_HEX_INFOHASH
+```
+
+Provide trusted `.torrent` files named `<lowercase-infohash>.torrent` for the
+targets and for complete reference torrents that contain the same media inodes.
+The JSON manifest maps each exact **target** infohash to an object such as:
+
+```json
+{
+  "1111111111111111111111111111111111111111": {
+    "sidecars": ["Mapped Release/subtitles.srt", "Mapped Release/sample.nfo"],
+    "media_sources": ["2222222222222222222222222222222222222222"]
+  }
+}
+```
+
+Declare only genuinely optional files, using **current Deluge paths relative to
+that torrent's save directory**, and choose references that are known to have
+the same media bytes. The command uses `DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`,
+`DELUGE_PASSWORD`, `DELUGE_TORRENT_BASE_REMOTE_FOLDER` and
+`LOCAL_TORRENT_BASE_LOCAL_FOLDER` (environment or `.env`). Use a trusted Deluge
+2.2.x endpoint and transport, admin credentials for full inventory visibility,
+the Label plugin, and a stable local read-only view of the same payload tree.
+Targets must be individually paused, incomplete, labeled `cross-seed` or
+`*.cross-seed`; all files must be wanted (nonzero priority).
+No scan, cache, workspace, torrent changes, or file writes are needed. JSON is
+written to stdout; blocked variants include the reason and make the exit
+status nonzero.
+
+The planner requires the daemon's missing piece indices to exactly match the
+spans of absent declared sidecars. It hashes each readable target piece against
+the target metainfo and hashes the complete references to authenticate the
+shared media inodes, including bytes in pieces that cross absent sidecars.
+It rejects incomplete piece maps, unsafe paths, shared destinations, partial
+files, and unsupported metainfo (v2/hybrid, pad or symlink files), rather than
+estimating from file progress. For same-name/size sidecar donors, it checks
+every affected target piece with the original media before counting the donor.
+It reports absent sidecar bytes and affected piece bytes separately, including
+the short final piece, then ranks the remaining work after proven local donors.
+`remaining_piece_bytes` is the amount of unresolved piece data, not a transfer
+ceiling. Bytes expected by the target in an unhashable boundary piece can only
+be confirmed once the missing bytes are recovered. A plan is an observation,
+not a reservation, and does not authorize any torrent operation.
+The destination check requires an alias-free Deluge inventory: different save
+paths must not resolve to the same directory through symlinks or bind mounts.
+
+**Automated bounded download and apply are unavailable.** Stock Deluge 2.2
+[`move_storage`](https://github.com/deluge-torrent/deluge/blob/deluge-2.2.0/deluge/core/torrent.py#L1279-L1316)
+uses libtorrent's
+[`dont_replace`](https://github.com/arvidn/libtorrent/blob/v2.0.11/include/libtorrent/torrent_handle.hpp#L1314-L1326)
+mode, which removes source paths even when pre-staged destination files exist
+and can move/copy data; `download_location` changes an option, not the live
+storage. There is no safe stock RPC to switch both directions without risking
+the original paths. Deluge's
+[`force_recheck`](https://github.com/deluge-torrent/deluge/blob/deluge-2.2.0/deluge/core/torrent.py#L1411-L1426)
+also calls `resume()` internally. A rate cap and CLI counter polling cannot
+enforce a torrent-wide payload budget if the client dies, disconnects, stalls,
+or the daemon restarts. Finally, [cross-seed builds donor paths from the
+Deluge inventory](https://github.com/cross-seed/cross-seed/blob/4f86d0a8cf5d3e8022ae3ac1717ba5a5eef9a032/cross-seed/src/clients/Deluge.ts#L891-L992),
+not just from configured data directories. A private directory or this app's
+lock alone cannot keep an injecting job from discovering or linking its inodes.
+
+Execution requires a daemon-owned admission/watchdog and transfer guard with a
+bounded allowance for in-flight and redundant data, a non-destructive
+save-path switch and completion acknowledgement, and operational exclusion
+of external cross-seed inventory/injection for the entire workspace lifetime
+(including interruption). It must force reflinks without a copy fallback,
+verify private inodes and the isolated missing-piece map without changing file
+priorities, preserve interrupted work, verify recovered sidecars against target
+and sibling piece hashes on original media, and explicitly recheck after
+returning. Resume only at 100% with zero remaining bytes; remove the workspace
+only after verifying that no torrent retains its paths or inodes. The planner
+does none of those mutations. The existing download-free repair above is
+unchanged.
 
 ## Output Format
 
