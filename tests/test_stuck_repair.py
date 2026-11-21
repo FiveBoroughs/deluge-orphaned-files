@@ -144,6 +144,43 @@ def test_plan_skips_shared_destination(planner, tmp_path):
     assert all("another torrent" in p.files[0].reason for p in plans)
 
 
+def test_plan_skips_destination_shared_through_directory_alias(planner, tmp_path):
+    donor, _ = donor_torrent(tmp_path)
+    directory = tmp_path / "cross-seed-links/X"
+    directory.mkdir(parents=True)
+    (tmp_path / "alias").symlink_to(directory, target_is_directory=True)
+    other = make_torrent(label="tv", save_path=f"{REMOTE_BASE}/alias")
+
+    [plan] = planner.plan_all({"donor": donor, "target": make_torrent(), "other": other}, now=NOW, min_age_hours=24)
+
+    assert not plan.repairable
+    assert "another torrent" in plan.blocking_reason
+
+
+def test_plan_skips_destination_outside_base_through_symlink(planner, tmp_path):
+    donor, _ = donor_torrent(tmp_path)
+    base = tmp_path / "cross-seed-links"
+    base.mkdir()
+    (base / "X").symlink_to(tmp_path.parent, target_is_directory=True)
+
+    [plan] = planner.plan_all({"donor": donor, "target": make_torrent()}, now=NOW, min_age_hours=24)
+
+    assert not plan.repairable
+    assert "outside torrent base" in plan.blocking_reason
+
+
+def test_plan_rejects_symlink_donor(planner, tmp_path):
+    donor, donor_path = donor_torrent(tmp_path)
+    renamed = donor_path.rename(donor_path.with_suffix(".original"))
+    donor_path.symlink_to(renamed)
+    (tmp_path / "cross-seed-links/X").mkdir(parents=True)
+
+    [plan] = planner.plan_all({"donor": donor, "target": make_torrent()}, now=NOW, min_age_hours=24)
+
+    assert not plan.repairable
+    assert "no verified donor" in plan.blocking_reason
+
+
 def test_plan_skips_when_parent_dir_missing(planner, tmp_path):
     """Never create directories: a missing destination folder blocks repair."""
     donor, _ = donor_torrent(tmp_path)
@@ -258,6 +295,8 @@ class FakeClient:
         self.options = {"auto_managed": True, "max_download_speed": -1.0}
         self.payload = 1000
         self.checking = False
+        self.paused = True
+        self.state = "Paused"
         self._polls_left = 0
         self._durations = list(recheck_durations)
         self.measure_finished = measure_finished
@@ -293,17 +332,20 @@ class FakeClient:
         elif method == "core.force_recheck":
             self.force_rechecks += 1
             self.checking = True
+            self.paused = False
             self._polls_left = self._durations.pop(0) if self._durations else 1
             self._stale_left = self._stale_polls
         elif method == "core.pause_torrent":
             self.checking = False
+            self.paused = True
+            self.state = "Error" if self.state == "Error" else "Paused"
         elif method == "core.resume_torrent":
             self.resumed.append(args[0][0])
         return None
 
     def _status(self, fields):
         out = {}
-        state = self.final_state
+        state = self.state
         if self.checking:
             if self._stale_left > 0:
                 # Deluge's display state lags the libtorrent check that just
@@ -314,13 +356,16 @@ class FakeClient:
                 state = "Checking"
             else:
                 self.checking = False
-        payload = self.payload + (self.check_download_bump if state == "Checking" else 0)
+                state = self.state = self.final_state
+                self.paused = state in ("Paused", "Error")
+        payload = self.payload + (self.check_download_bump if state == "Checking" and self.force_rechecks == 1 else 0)
         values = {
             "state": state,
+            "paused": self.paused,
             "progress": self.measure_progress,
             "is_finished": self._finished,
             "all_time_download": payload,
-            "file_priorities": list(self.priorities),
+            "file_priorities": tuple(self.priorities),
             "file_progress": list(self.measure_file_progress) if self.measure_file_progress is not None else [1.0] * len(self.priorities),
             **self.options,
         }
@@ -517,10 +562,14 @@ def test_link_failure_puts_original_back(tmp_path, monkeypatch):
     """S2: if os.link fails after the rename, the original must not be stranded as a backup."""
     clock = FakeClock()
     client = FakeClient(priorities=[4])
-    plan, dest, _ = make_plan(tmp_path, with_dest_content=b"partial-junk!")
+    plan, dest, donor = make_plan(tmp_path, with_dest_content=b"partial-junk!")
 
-    def failing_link(src, dst):
-        raise OSError(18, "Invalid cross-device link")
+    link = os.link
+
+    def failing_link(src, dst, **kwargs):
+        if src == donor:
+            raise OSError(18, "Invalid cross-device link")
+        return link(src, dst, **kwargs)
 
     monkeypatch.setattr(stuck_repair.os, "link", failing_link)
     result = make_executor(client, clock).repair(plan)
@@ -530,18 +579,18 @@ def test_link_failure_puts_original_back(tmp_path, monkeypatch):
     assert not Path(str(dest) + ".delugeof-repair-bak").exists()
 
 
-def test_repeated_rollback_never_deletes_restored_original(tmp_path):
-    """S3: rollback runs twice (restore RPC fails in between); original must survive both passes."""
+def test_priorities_restore_failure_leaves_original_in_place(tmp_path):
     clock = FakeClock()
     # Priority-set calls: 1 guard-zero, 2 measure-restore, 3 rollback-recheck-zero,
-    # 4 rollback-restore (fails), 5 retry-zero, 6 retry-restore.
-    client = FakeClient(priorities=[4], recheck_durations=(1, 1, 1), measure_finished=False, measure_progress=99.5, measure_file_progress=[0.995], fail_prio_set_on={4})
+    # 4 rollback-restore (fails).
+    client = FakeClient(priorities=[4], recheck_durations=(1, 1), measure_finished=False, measure_progress=99.5, measure_file_progress=[0.995], fail_prio_set_on={4})
     plan, dest, _ = make_plan(tmp_path, with_dest_content=b"partial-junk!")
 
     result = make_executor(client, clock).repair(plan)
 
     assert dest.read_bytes().startswith(b"partial-junk!")
     assert result.outcome == "error"
+    assert client.force_rechecks == 2
 
 
 def test_error_state_never_counts_as_verified(tmp_path):
@@ -581,3 +630,262 @@ def test_stale_settled_polls_do_not_complete_check_early(tmp_path):
     assert result.outcome == "repaired"
     assert client.force_rechecks == 1  # no premature measurement -> rollback -> second recheck
     assert clock.t < stuck_repair.RECHECK_START_GRACE_SECONDS
+
+
+@pytest.mark.parametrize("missing", ["state", "paused", "file_priorities", "auto_managed", "max_download_speed", "all_time_download"])
+def test_incomplete_snapshot_leaves_torrent_and_files_untouched(tmp_path, missing):
+    class IncompleteStatus(FakeClient):
+        def _status(self, fields):
+            result = super()._status(fields)
+            result.pop(missing.encode(), None)
+            return result
+
+    client = IncompleteStatus(priorities=[4])
+    plan, dest, _ = make_plan(tmp_path, with_dest_content=b"partial-junk!")
+
+    result = make_executor(client, FakeClock()).repair(plan)
+
+    assert result.outcome == "error"
+    assert dest.read_bytes().startswith(b"partial-junk!")
+    assert {method for method, _ in client.calls} == {"core.get_torrent_status"}
+
+
+@pytest.mark.parametrize(
+    ("invalid_counter", "persistent", "expected_rechecks"),
+    [(None, False, 2), (1, False, 2), (None, True, 1)],
+    ids=["missing", "reset", "missing-through-rollback"],
+)
+def test_download_counter_lost_during_recheck_rolls_back(tmp_path, invalid_counter, persistent, expected_rechecks):
+    class LostCounter(FakeClient):
+        def _status(self, fields):
+            result = super()._status(fields)
+            if self.force_rechecks == 1 and b"all_time_download" in result and (persistent or "state" in fields):
+                result[b"all_time_download"] = invalid_counter
+            return result
+
+    client = LostCounter(priorities=[4])
+    plan, dest, _ = make_plan(tmp_path, with_dest_content=b"partial-junk!")
+
+    result = make_executor(client, FakeClock()).repair(plan)
+
+    assert result.outcome == "error"
+    assert "cannot enforce download abort guard" in result.detail
+    assert dest.read_bytes().startswith(b"partial-junk!")
+    assert client.force_rechecks == expected_rechecks
+    assert client.paused and client.state == "Paused"
+    assert not Path(str(dest) + stuck_repair.BACKUP_SUFFIX).exists()
+    assert client.resumed == []
+    assert client.priorities == [4]
+    assert client.options == {"auto_managed": True, "max_download_speed": -1.0}
+
+
+def test_counter_decrease_above_baseline_is_not_accepted(tmp_path):
+    class CounterReset(FakeClient):
+        def __init__(self):
+            super().__init__(priorities=[4], recheck_durations=(2, 1))
+            self.samples = iter((self.payload + 200, self.payload + 100))
+
+        def _status(self, fields):
+            status = super()._status(fields)
+            if self.force_rechecks == 1 and "state" in fields and "all_time_download" in fields:
+                status[b"all_time_download"] = next(self.samples, self.payload + 100)
+            return status
+
+    plan, dest, _ = make_plan(tmp_path, with_dest_content=b"partial-junk!")
+    client = CounterReset()
+
+    result = make_executor(client, FakeClock()).repair(plan)
+
+    assert "reset during recheck" in result.detail
+    assert dest.read_bytes().startswith(b"partial-junk!")
+    assert not client.resumed
+
+
+@pytest.mark.parametrize("late_counter", [None, 2 * MB], ids=["lost", "over-budget"])
+def test_pause_confirmation_is_still_guarded(tmp_path, late_counter):
+    class LateCounter(FakeClient):
+        def _status(self, fields):
+            status = super()._status(fields)
+            if self.force_rechecks == 1 and self.paused and "state" in fields and "all_time_download" in fields:
+                status[b"all_time_download"] = None if late_counter is None else self.payload + late_counter
+            return status
+
+    client = LateCounter(priorities=[4], final_state="Seeding")
+    plan, dest, _ = make_plan(tmp_path, with_dest_content=b"partial-junk!")
+
+    result = make_executor(client, FakeClock()).repair(plan)
+
+    assert result.outcome == ("error" if late_counter is None else "aborted-download")
+    assert dest.read_bytes().startswith(b"partial-junk!")
+    assert not client.resumed
+
+
+def test_rollback_recheck_timeout_does_not_start_another_recheck(tmp_path):
+    client = FakeClient(priorities=[4], recheck_durations=(1, 10_000), measure_file_progress=[0.995])
+    plan, dest, _ = make_plan(tmp_path, with_dest_content=b"partial-junk!")
+
+    result = make_executor(client, FakeClock(), recheck_timeout_seconds=30).repair(plan)
+
+    assert result.outcome == "error"
+    assert "rollback: recheck timed out" in result.detail
+    assert dest.read_bytes().startswith(b"partial-junk!")
+    assert client.force_rechecks == 2
+    assert client.paused and client.priorities == [4]
+    assert client.options == {"auto_managed": True, "max_download_speed": -1.0}
+
+
+@pytest.mark.parametrize("pause", ["immediate", "delayed", "lost-reply"])
+def test_rollback_keeps_guard_until_repaused_after_auto_management(tmp_path, pause):
+    class AutoRestarts(FakeClient):
+        restarted = False
+        pending_pause = 0
+
+        def call(self, method, *args):
+            if method == "core.pause_torrent" and self.restarted and pause == "delayed":
+                self.pending_pause = 2
+                return None
+            result = super().call(method, *args)
+            if method == "core.set_torrent_options" and args[1].get("auto_managed"):
+                assert self.options["max_download_speed"] == 10.0
+                assert self.priorities == [0]
+                self.restarted = True
+                self.state = "Downloading"
+                self.paused = False
+                if pause == "lost-reply":
+                    raise ConnectionError("auto-management reply lost")
+            return result
+
+        def _status(self, fields):
+            if self.pending_pause and "paused" in fields:
+                self.pending_pause -= 1
+                if self.pending_pause == 0:
+                    super().call("core.pause_torrent", ["abc"])
+            return super()._status(fields)
+
+    client = AutoRestarts(priorities=[4], measure_file_progress=[0.995])
+    plan, dest, _ = make_plan(tmp_path, with_dest_content=b"partial-junk!")
+
+    result = make_executor(client, FakeClock()).repair(plan)
+
+    assert client.restarted
+    if pause != "immediate":
+        assert result.outcome == "error"
+        expected = "guard reasserted" if pause == "delayed" else "auto-management reply lost"
+        assert expected in result.detail
+        assert client.priorities == [0]
+        assert client.options["max_download_speed"] == 10.0
+        if pause == "delayed":
+            assert client.options["auto_managed"] is False
+    else:
+        assert result.outcome == "failed"
+        assert client.priorities == [4]
+        assert client.options == {"auto_managed": True, "max_download_speed": -1.0}
+    assert dest.read_bytes().startswith(b"partial-junk!")
+    assert client.state == "Paused" and client.paused
+    assert not client.resumed
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_unconfirmed_pause_preserves_backup_and_guard(tmp_path, drift):
+    class RefusesPause(FakeClient):
+        deactivated_at = None
+
+        def _status(self, fields):
+            if drift and self.force_rechecks == 1 and "all_time_download" in fields and "state" in fields:
+                self.options["auto_managed"] = True
+                self.priorities = [4]
+            return super()._status(fields)
+
+        def call(self, method, *args):
+            if method == "core.pause_torrent":
+                return None
+            if method == "core.set_torrent_options" and drift and self.force_rechecks == 1:
+                self.deactivated_at = clock.t
+            return super().call(method, *args)
+
+    clock = FakeClock()
+    client = RefusesPause(priorities=[4], final_state="Seeding", measure_file_progress=[0.995])
+    plan, dest, donor = make_plan(tmp_path, with_dest_content=b"partial-junk!")
+
+    result = make_executor(client, clock).repair(plan)
+
+    assert result.outcome == "error"
+    assert ("auto_managed" if drift else "could not confirm") in result.detail
+    assert dest.samefile(donor)
+    assert Path(str(dest) + stuck_repair.BACKUP_SUFFIX).read_bytes().startswith(b"partial-junk!")
+    assert client.force_rechecks == 1
+    assert client.resumed == []
+    assert client.priorities == [0]
+    assert client.options == {"auto_managed": False, "max_download_speed": 10.0}
+    if drift:
+        assert client.deactivated_at < stuck_repair.PAUSE_SETTLE_SECONDS
+
+
+def test_backup_created_during_apply_is_not_overwritten(tmp_path, monkeypatch):
+    client = FakeClient(priorities=[4])
+    plan, dest, _ = make_plan(tmp_path, with_dest_content=b"partial-junk!")
+    backup = Path(str(dest) + stuck_repair.BACKUP_SUFFIX)
+    link = os.link
+
+    def wait_for_collision(src, dst, **kwargs):
+        if dst == backup:
+            backup.write_bytes(b"keep me")
+        return link(src, dst, **kwargs)
+
+    monkeypatch.setattr(stuck_repair.os, "link", wait_for_collision)
+    result = make_executor(client, FakeClock()).repair(plan)
+
+    assert result.outcome == "error"
+    assert dest.read_bytes().startswith(b"partial-junk!")
+    assert backup.read_bytes() == b"keep me"
+    assert client.force_rechecks == 0
+
+
+def test_backup_cleanup_failure_does_not_roll_back_verified_links(tmp_path, monkeypatch):
+    client = FakeClient(priorities=[4, 4])
+    plan, first, donor = make_plan(tmp_path, with_dest_content=b"first-original")
+    second = make_file(first.with_name("second.mkv"), 64, b"second-original")
+    plan.files.append(FilePlan(1, f"{REMOTE_BASE}/dest/second.mkv", second, 64, ACTION_REPLACE, donor_local=donor))
+    first_backup = Path(str(first) + stuck_repair.BACKUP_SUFFIX)
+    second_backup = Path(str(second) + stuck_repair.BACKUP_SUFFIX)
+    unlink = Path.unlink
+
+    def fail_one_backup(path, *args, **kwargs):
+        if path == second_backup:
+            raise PermissionError("cannot delete second backup")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_one_backup)
+    result = make_executor(client, FakeClock()).repair(plan)
+
+    assert result.outcome == "repaired"
+    assert "cannot delete second backup" in result.detail
+    assert first.samefile(donor) and second.samefile(donor)
+    assert not first_backup.exists()
+    assert second_backup.read_bytes().startswith(b"second-original")
+    assert client.force_rechecks == 1
+    assert client.resumed == ["abc"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "detail"),
+    [("auto_managed", True, "auto_managed"), ("max_download_speed", 0.0, "max_download_speed"), ("file_priorities", (4,), "priorities no longer guarded")],
+)
+def test_guard_readback_drift_during_check_rolls_back(tmp_path, field, value, detail):
+    class GuardDrift(FakeClient):
+        def _status(self, fields):
+            result = super()._status(fields)
+            if self.force_rechecks == 1 and fields[0] == "state" and "all_time_download" in fields:
+                result[field.encode()] = value
+            return result
+
+    client = GuardDrift(priorities=[4])
+    plan, dest, _ = make_plan(tmp_path, with_dest_content=b"partial-junk!")
+
+    result = make_executor(client, FakeClock()).repair(plan)
+
+    assert result.outcome == "error"
+    assert detail in result.detail
+    assert dest.read_bytes().startswith(b"partial-junk!")
+    assert client.resumed == []
+    assert client.force_rechecks == 2

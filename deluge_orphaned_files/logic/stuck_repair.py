@@ -34,8 +34,10 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import shutil
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,7 +66,7 @@ STATUS_FIELDS = [
     "file_progress",
     "file_priorities",
 ]
-POLL_FIELDS = ["state", "progress", "is_finished", "all_time_download", "total_payload_download"]
+PAYLOAD_FIELDS = ("all_time_download", "total_payload_download")
 MEASURE_FIELDS = ["state", "progress", "is_finished", "file_progress", "file_priorities"]
 # The option subset the guard touches, and therefore snapshots/restores.
 GUARD_OPTION_KEYS = ["auto_managed", "max_download_speed"]
@@ -94,13 +96,19 @@ def _to_local(remote_path: str, remote_base: str, local_base: str) -> Optional[P
     return Path(local_base) / relative
 
 
-def _stat_key(path: Path) -> Optional[Tuple[int, int, int]]:
-    """(st_dev, st_ino, st_size) or None if the path does not exist."""
+def _regular_file_key(path: Path) -> Optional[Tuple[int, int, int]]:
+    """Return a regular file's identity, without following a final symlink."""
     try:
-        st = path.stat()
-    except OSError:
+        st = path.lstat()
+    except FileNotFoundError:
         return None
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(f"not a regular file: {path}")
     return (st.st_dev, st.st_ino, st.st_size)
+
+
+def _backup_path(dest: Path) -> Path:
+    return dest.with_name(dest.name + BACKUP_SUFFIX)
 
 
 # --------------------------------------------------------------------------
@@ -178,11 +186,18 @@ def build_donor_index(torrents: Dict[str, dict], *, size_only_min_bytes: int) ->
     return index
 
 
-def _destination_owners(torrents: Dict[str, dict]) -> Dict[str, Set[str]]:
-    owners: Dict[str, Set[str]] = {}
+def _destination_owners(torrents: Dict[str, dict], remote_base: str, local_base: str) -> Dict[Path, Set[str]]:
+    owners: Dict[Path, Set[str]] = {}
     for torrent_id, torrent in torrents.items():
         for file_entry in torrent["files"]:
-            owners.setdefault(_remote_full_path(torrent, file_entry), set()).add(torrent_id)
+            local = _to_local(_remote_full_path(torrent, file_entry), remote_base, local_base)
+            if local is None:
+                continue
+            try:
+                owners.setdefault(local.resolve(), set()).add(torrent_id)
+            except (OSError, RuntimeError):
+                # An unresolvable path cannot identify a shared destination.
+                continue
     return owners
 
 
@@ -191,10 +206,11 @@ class Planner:
         self._remote_base = os.path.normpath(remote_base)
         self._local_base = os.path.normpath(local_base)
         self._size_only_min_bytes = size_only_min_bytes
+        self._resolved_local_base = Path(local_base).resolve()
 
     def plan_all(self, torrents: Dict[str, dict], *, now: float, min_age_hours: float) -> List[TorrentPlan]:
         donors = build_donor_index(torrents, size_only_min_bytes=self._size_only_min_bytes)
-        owners = _destination_owners(torrents)
+        owners = _destination_owners(torrents, self._remote_base, self._local_base)
         plans = []
         for torrent_id, torrent in torrents.items():
             if is_stuck(torrent, now=now, min_age_hours=min_age_hours):
@@ -202,7 +218,7 @@ class Planner:
         plans.sort(key=lambda p: -p.progress)
         return plans
 
-    def _plan_torrent(self, torrent_id: str, torrent: dict, donors: DonorIndex, owners: Dict[str, Set[str]], now: float) -> TorrentPlan:
+    def _plan_torrent(self, torrent_id: str, torrent: dict, donors: DonorIndex, owners: Dict[Path, Set[str]], now: float) -> TorrentPlan:
         plan = TorrentPlan(
             torrent_id=torrent_id,
             name=torrent.get("name") or torrent_id,
@@ -227,20 +243,28 @@ class Planner:
 
         if local_dest is None:
             return FilePlan(**base, action=ACTION_SKIP, reason="destination outside torrent base folder")
-        if owners.get(remote_dest, set()) - {torrent_id}:
-            return FilePlan(**base, action=ACTION_SKIP, reason="destination also used by another torrent")
-        if not local_dest.parent.is_dir():
-            # Never create directories (issue #1): dirs created by the wrong
-            # user later break Deluge's own file creation with EACCES.
-            return FilePlan(**base, action=ACTION_SKIP, reason="destination directory missing (refusing to create it)")
-        if Path(str(local_dest) + BACKUP_SUFFIX).exists():
-            return FilePlan(**base, action=ACTION_SKIP, reason="stale backup from an earlier repair exists")
+        try:
+            parent = local_dest.parent.resolve()
+            if not parent.is_relative_to(self._resolved_local_base):
+                return FilePlan(**base, action=ACTION_SKIP, reason="destination outside torrent base folder")
+            canonical_dest = parent / local_dest.name
+            if owners.get(canonical_dest, set()) - {torrent_id}:
+                return FilePlan(**base, action=ACTION_SKIP, reason="destination also used by another torrent")
+            if not parent.is_dir():
+                return FilePlan(**base, action=ACTION_SKIP, reason="destination directory missing (refusing to create it)")
+            backup = _backup_path(canonical_dest)
+            if backup.exists() or backup.is_symlink() or backup in owners:
+                return FilePlan(**base, action=ACTION_SKIP, reason="stale backup or reserved backup path")
+            dest_key = _regular_file_key(canonical_dest)
+        except (OSError, RuntimeError) as exc:
+            return FilePlan(**base, action=ACTION_SKIP, reason=str(exc))
+        # Use the checked directory rather than traversing its alias at apply time.
+        base["local_dest"] = canonical_dest
 
         donor_remote, donor_local, donor_key, donor_error = self._choose_donor(torrent_id, file_entry, donors)
         if donor_local is None:
             return FilePlan(**base, action=ACTION_SKIP, reason=donor_error)
 
-        dest_key = _stat_key(local_dest)
         if dest_key is None:
             return FilePlan(**base, action=ACTION_LINK, donor_local=donor_local, donor_remote=donor_remote)
         if dest_key[:2] == donor_key[:2]:
@@ -264,7 +288,14 @@ class Planner:
                 local = _to_local(remote, self._remote_base, self._local_base)
                 if local is None:
                     continue
-                key = _stat_key(local)
+                try:
+                    parent = local.parent.resolve()
+                    if not parent.is_relative_to(self._resolved_local_base):
+                        continue
+                    local = parent / local.name
+                    key = _regular_file_key(local)
+                except (OSError, RuntimeError):
+                    continue
                 if key is not None and key[2] == size:
                     found.append((remote, local, key))
             return found
@@ -311,11 +342,11 @@ def _torrent_status(client, torrent_id: str, fields: Sequence[str]) -> dict:
     return {_d(k): _d(v) for k, v in raw.items()}
 
 
-def _payload_downloaded(status: dict) -> Optional[int]:
-    for key in ("all_time_download", "total_payload_download"):
-        if key in status and status[key] is not None:
-            return int(status[key])
-    return None
+def _payload_counter(status: dict, key: str) -> int:
+    value = status.get(key)
+    if type(value) is not int or value < 0:
+        raise RepairError(f"missing or invalid {key}; cannot enforce download abort guard")
+    return value
 
 
 class RepairExecutor:
@@ -337,6 +368,8 @@ class RepairExecutor:
         self._download_abort_bytes = download_abort_bytes
         self._recheck_timeout_seconds = recheck_timeout_seconds
         self._poll_seconds = poll_seconds
+        if not math.isfinite(max_download_speed_kib) or max_download_speed_kib < 1 / 1024:
+            raise ValueError("REPAIR_MAX_DOWNLOAD_SPEED_KIB must represent a positive rate of at least 1 byte/s")
         self._sleep = sleep_fn
         self._monotonic = monotonic_fn
 
@@ -345,14 +378,17 @@ class RepairExecutor:
     def repair(self, plan: TorrentPlan) -> RepairResult:
         tid = plan.torrent_id
         logger.info("Repairing {} ({}): {} file(s)", plan.name, tid, len(plan.files))
-        linked: List[FilePlan] = []  # files we created/replaced, for rollback
+        linked: List[Tuple[FilePlan, Tuple[int, int]]] = []
         snapshot: Optional[dict] = None
+        recheck_attempted = False
         try:
             snapshot = self._snapshot(tid)
             for file_plan in plan.files:
-                if self._apply_file_plan(file_plan):
-                    linked.append(file_plan)
+                donor_inode = self._apply_file_plan(file_plan)
+                if donor_inode is not None:
+                    linked.append((file_plan, donor_inode))
 
+            recheck_attempted = True
             _downloaded, ok = self._guarded_recheck(tid, snapshot)
             if ok == "done":
                 # Measure only after priorities are back: with every file at
@@ -365,17 +401,29 @@ class RepairExecutor:
                 # is_finished=False whenever a file goes from priority 0 to
                 # positive — which the restore above just did. The checked
                 # piece map is the only reliable verdict: every wanted file
-                # complete, in a non-Error state.
+                # complete after safely pausing the torrent.
                 file_progress = status.get("file_progress") or []
-                file_priorities = status.get("file_priorities") or []
-                wanted_complete = bool(file_progress) and len(file_progress) == len(file_priorities) and all(float(fp) >= 1.0 for fp, pr in zip(file_progress, file_priorities) if int(pr) > 0)
-                if status.get("state") != "Error" and wanted_complete:
+                priorities = snapshot["file_priorities"]
+                wanted_complete = (
+                    list(status.get("file_priorities") or []) == priorities
+                    and len(file_progress) == len(priorities)
+                    and any(pr > 0 for pr in priorities)
+                    and all(float(fp) >= 1.0 for fp, pr in zip(file_progress, priorities) if pr > 0)
+                )
+                if status.get("state") == "Paused" and wanted_complete:
                     self._restore_options(tid, snapshot)
                     _call(self._client, "core.resume_torrent", [tid])
-                    for file_plan in linked:
-                        self._discard_backup(file_plan)
+                    # Verification succeeded and the torrent was resumed; a
+                    # cleanup error must not roll back these now-live links.
+                    cleanup_failures = []
+                    for file_plan, _ in linked:
+                        try:
+                            self._discard_backup(file_plan)
+                        except OSError as exc:
+                            logger.warning("Keeping backup for {}: {}", file_plan.local_dest, exc)
+                            cleanup_failures.append(str(exc))
                     logger.success("Repaired {}: verified 100%, resumed", plan.name)
-                    return RepairResult(tid, plan.name, "repaired")
+                    return RepairResult(tid, plan.name, "repaired", "; ".join(cleanup_failures))
                 detail = f"state={status.get('state')} progress={float(status.get('progress') or 0.0):.2f}% is_finished={status.get('is_finished')} wanted_complete={wanted_complete} after recheck"
                 outcome = "failed"
             else:
@@ -383,27 +431,32 @@ class RepairExecutor:
                 outcome = "aborted-download" if ok.startswith("downloaded") else ("timed-out" if ok == "recheck timed out" else "error")
 
             logger.warning("Repair of {} did not verify ({}); rolling back", plan.name, detail)
-            self._rollback(tid, snapshot, linked)
+            try:
+                self._rollback(tid, snapshot, linked)
+            except Exception as exc:
+                logger.error("Rollback for {} did not finish: {} — check this torrent manually", tid, exc)
+                return RepairResult(tid, plan.name, "error", f"{detail}; rollback: {exc}")
             return RepairResult(tid, plan.name, outcome, detail)
         except Exception as exc:
             logger.exception("Repair of {} raised: {}", plan.name, exc)
-            self._best_effort_restore(tid, snapshot, linked)
+            if linked or recheck_attempted:
+                self._best_effort_restore(tid, snapshot, linked)
             return RepairResult(tid, plan.name, "error", str(exc))
 
     # -- snapshot / guard -----------------------------------------------------
 
     def _snapshot(self, tid: str) -> dict:
-        status = _torrent_status(self._client, tid, ["file_priorities", *GUARD_OPTION_KEYS])
-        if "file_priorities" not in status:
-            raise RepairError("torrent status carries no file_priorities")
-        payload = _payload_downloaded(_torrent_status(self._client, tid, POLL_FIELDS))
-        if payload is None:
-            raise RepairError("no payload download counter in torrent status; cannot enforce download abort guard")
-        snapshot = {"file_priorities": list(status["file_priorities"])}
-        for key in GUARD_OPTION_KEYS:
-            if key in status:
-                snapshot[key] = status[key]
-        return snapshot
+        fields = ["state", "paused", "file_priorities", *GUARD_OPTION_KEYS, *PAYLOAD_FIELDS]
+        status = _torrent_status(self._client, tid, fields)
+        if status.get("state") != "Paused" or status.get("paused") is not True:
+            raise RepairError("torrent is no longer paused; refusing to change its files")
+        if not status.get("file_priorities") or any(status.get(key) is None for key in GUARD_OPTION_KEYS):
+            raise RepairError("torrent status lacks original options or priorities; cannot restore the guard")
+        status["file_priorities"] = [int(p) for p in status["file_priorities"]]
+        counter = next((key for key in PAYLOAD_FIELDS if status.get(key) is not None), PAYLOAD_FIELDS[0])
+        _payload_counter(status, counter)
+        status["payload_counter"] = counter
+        return status
 
     def _set_priorities(self, tid: str, priorities: Sequence[int]) -> None:
         # Deluge 2.2 core.set_torrent_file_priorities takes ONE torrent id
@@ -415,145 +468,213 @@ class RepairExecutor:
 
     def _set_guard_options(self, tid: str) -> None:
         _call(self._client, "core.set_torrent_options", [tid], {"auto_managed": False, "max_download_speed": self._max_download_speed_kib})
-        actual = _torrent_status(self._client, tid, GUARD_OPTION_KEYS)
+        self._verify_guard_options(_torrent_status(self._client, tid, GUARD_OPTION_KEYS))
+
+    def _verify_guard_options(self, actual: dict) -> None:
         if actual.get("auto_managed") not in (False, 0):
             raise RepairError(f"auto_managed readback is {actual.get('auto_managed')!r}, expected False")
         speed = actual.get("max_download_speed")
-        if speed is None or float(speed) < 0 or float(speed) > self._max_download_speed_kib:
-            raise RepairError(f"max_download_speed readback is {speed!r}, expected <= {self._max_download_speed_kib}")
+        if speed is None or not 1 / 1024 <= float(speed) <= self._max_download_speed_kib:
+            raise RepairError(f"max_download_speed readback is {speed!r}, expected a positive rate <= {self._max_download_speed_kib}")
 
     def _restore_options(self, tid: str, snapshot: dict) -> None:
-        options = {key: snapshot[key] for key in GUARD_OPTION_KEYS if key in snapshot}
-        if options:
-            _call(self._client, "core.set_torrent_options", [tid], options)
+        _call(self._client, "core.set_torrent_options", [tid], {key: snapshot[key] for key in GUARD_OPTION_KEYS})
 
     # -- files ------------------------------------------------------------------
 
-    def _apply_file_plan(self, file_plan: FilePlan) -> bool:
-        """Create/replace the destination link. Returns True if rollback must undo it."""
+    def _apply_file_plan(self, file_plan: FilePlan) -> Optional[Tuple[int, int]]:
+        """Install a donor link; return its inode if rollback must undo it."""
         dest = file_plan.local_dest
         donor = file_plan.donor_local
-        if file_plan.action == ACTION_ALREADY_LINKED or dest is None or donor is None:
-            return False
+        if dest is None or donor is None:
+            raise RepairError(f"invalid repair plan for {file_plan.remote_dest}")
+        donor_key = _regular_file_key(donor)
+        if donor_key is None or donor_key[2] != file_plan.size:
+            raise RepairError(f"donor changed since planning: {donor}")
+        dest_key = _regular_file_key(dest)
+        if file_plan.action == ACTION_ALREADY_LINKED:
+            if dest_key != donor_key:
+                raise RepairError(f"destination no longer linked to donor: {dest}")
+            return None
+
+        backup = _backup_path(dest)
+        if backup.exists() or backup.is_symlink():
+            raise RepairError(f"backup path appeared since planning: {backup}")
         if file_plan.action == ACTION_REPLACE:
-            os.rename(dest, str(dest) + BACKUP_SUFFIX)
+            if dest_key is None:
+                raise RepairError(f"partial file disappeared since planning: {dest}")
+            # Unlike rename, link cannot overwrite a backup created since
+            # planning (including a dangling symlink).
+            os.link(dest, backup, follow_symlinks=False)
+            dest.unlink()
         try:
-            os.link(donor, dest)
+            os.link(donor, dest, follow_symlinks=False)
         except OSError:
-            # Undo the rename right here: the caller only journals files this
-            # method reports as applied, so a failure must not strand the
-            # original as a backup with the destination missing.
             if file_plan.action == ACTION_REPLACE:
-                backup = Path(str(dest) + BACKUP_SUFFIX)
-                if backup.exists() and not dest.exists():
-                    os.rename(backup, dest)
+                # Restore without overwriting a file that appeared meanwhile.
+                os.link(backup, dest, follow_symlinks=False)
+                backup.unlink()
             raise
         logger.info("Linked {} -> {}", donor, dest)
-        return True
+        return donor_key[:2]
 
     def _discard_backup(self, file_plan: FilePlan) -> None:
         if file_plan.action != ACTION_REPLACE or file_plan.local_dest is None:
             return
-        backup = Path(str(file_plan.local_dest) + BACKUP_SUFFIX)
-        backup.unlink(missing_ok=True)
+        _backup_path(file_plan.local_dest).unlink(missing_ok=True)
 
-    def _rollback_files(self, linked: List[FilePlan]) -> None:
-        """Restore journaled files, consuming the journal as entries succeed.
-
-        Popping each restored entry makes rollback safe to repeat (the
-        best-effort path retries after a partial rollback): a second pass
-        must never unlink an original the first pass already put back.
-        """
+    def _rollback_files(self, linked: List[Tuple[FilePlan, Tuple[int, int]]]) -> None:
+        """Consume restored journal entries so rollback is safe to repeat."""
         while linked:
-            file_plan = linked[-1]
+            file_plan, donor_inode = linked[-1]
             dest = file_plan.local_dest
-            if dest is not None:
-                dest.unlink(missing_ok=True)
-                if file_plan.action == ACTION_REPLACE:
-                    backup = Path(str(dest) + BACKUP_SUFFIX)
-                    if backup.exists():
-                        os.rename(backup, dest)
+            dest_key = _regular_file_key(dest)
+            if dest_key is not None and dest_key[:2] != donor_inode:
+                raise RepairError(f"destination changed during repair; refusing to overwrite it: {dest}")
+            if file_plan.action == ACTION_REPLACE:
+                # Restore in one operation: a missing backup must not cause
+                # the only remaining copy at the destination to be unlinked.
+                os.replace(_backup_path(dest), dest)
+            elif dest_key is not None:
+                dest.unlink()
             linked.pop()
 
     # -- recheck ------------------------------------------------------------------
 
     def _guarded_recheck(self, tid: str, snapshot: dict) -> Tuple[int, str]:
-        """Zero priorities, cap speed, force recheck, watch payload downloads.
-
-        Returns (bytes_downloaded, "done") or (bytes, reason-string).
-        Priorities/options are intentionally left guarded on return; the
-        caller decides when to restore them (measure-then-resume needs
-        priorities back while the speed cap is still on).
-        """
-        self._set_priorities(tid, [0] * len(snapshot["file_priorities"]))
+        """Zero priorities, cap speed, force recheck, watch payload downloads."""
+        counter = snapshot["payload_counter"]
         self._set_guard_options(tid)
-        baseline = _payload_downloaded(_torrent_status(self._client, tid, POLL_FIELDS)) or 0
+        priorities_to_set = [0] * len(snapshot["file_priorities"])
+        self._set_priorities(tid, priorities_to_set)
+        baseline = _payload_counter(_torrent_status(self._client, tid, [counter]), counter)
+        previous = baseline
+        fields = ["state", "paused", counter, *GUARD_OPTION_KEYS, "file_priorities"]
+
+        def sample(status: dict) -> int:
+            nonlocal previous
+            self._verify_guard_options(status)
+            priorities = status.get("file_priorities")
+            if priorities is None or list(priorities) != priorities_to_set:
+                raise RepairError("file priorities no longer guarded during recheck")
+            current = _payload_counter(status, counter)
+            if current < previous:
+                raise RepairError(f"{counter} reset during recheck; cannot enforce download abort guard")
+            previous = current
+            return current - baseline
+
         _call(self._client, "core.force_recheck", [tid])
 
         started = self._monotonic()
         seen_checking = False
         while True:
-            status = _torrent_status(self._client, tid, POLL_FIELDS)
-            payload = _payload_downloaded(status)
-            downloaded = (payload - baseline) if payload is not None else 0
+            status = _torrent_status(self._client, tid, fields)
+            downloaded = sample(status)
             if downloaded > self._download_abort_bytes:
                 logger.error("Download guard tripped for {}: {} bytes downloaded during recheck", tid, downloaded)
-                self._pause_and_settle(tid)
                 return downloaded, f"downloaded {downloaded} bytes during recheck (limit {self._download_abort_bytes})"
             state = status.get("state")
+            if not state:
+                raise RepairError("missing torrent state during recheck")
             if state == "Error":
                 return downloaded, "torrent entered Error state during recheck"
             elapsed = self._monotonic() - started
             if state == "Checking":
                 seen_checking = True
-            else:
-                if seen_checking:
-                    return downloaded, "done"
-                # Settled without ever sampling Checking is ambiguous. It can
-                # mean the check already finished between polls — or that it
-                # has not started yet: libtorrent clears piece accounting
-                # when a check starts while Deluge's display state lags, so
-                # neither "settled" nor changed piece counters prove
-                # completion. (Daemon events would, but the deluge-client
-                # package cannot deliver them to a local callback.) Only
-                # after the start grace do we proceed and let the caller's
-                # wanted-file measurement decide; a check that never ran
-                # leaves it incomplete and rolls back safely.
-                if elapsed > RECHECK_START_GRACE_SECONDS:
-                    logger.warning("No Checking state observed for {} within {}s; proceeding to measurement", tid, RECHECK_START_GRACE_SECONDS)
+            elif state in ("Paused", "Seeding", "Downloading"):
+                # Without seeing Checking, allow for a delayed start before
+                # measuring the wanted-file map (a short check can be missed).
+                if seen_checking or elapsed > RECHECK_START_GRACE_SECONDS:
+                    status, downloaded = self._wait_for_pause(tid, fields, sample)
+                    if downloaded > self._download_abort_bytes:
+                        return downloaded, f"downloaded {downloaded} bytes during recheck (limit {self._download_abort_bytes})"
+                    if status["state"] == "Error":
+                        return downloaded, "torrent entered Error state during recheck"
                     return downloaded, "done"
             if elapsed > self._recheck_timeout_seconds:
-                self._pause_and_settle(tid)
                 return downloaded, "recheck timed out"
             self._sleep(self._poll_seconds)
 
-    def _pause_and_settle(self, tid: str) -> None:
+    def _wait_for_pause(self, tid: str, fields: Sequence[str], sample: Optional[Callable[[dict], int]] = None, *, on_unconfirmed: Optional[Callable[[], None]] = None) -> Tuple[dict, int]:
         _call(self._client, "core.pause_torrent", [tid])
         deadline = self._monotonic() + PAUSE_SETTLE_SECONDS
         while self._monotonic() < deadline:
-            if _torrent_status(self._client, tid, ["state"]).get("state") in ("Paused", "Seeding", "Error"):
-                return
+            status = _torrent_status(self._client, tid, fields)
+            downloaded = sample(status) if sample is not None else 0
+            if status.get("paused") is True and status.get("state") in ("Paused", "Error"):
+                return status, downloaded
+            if on_unconfirmed is not None:
+                on_unconfirmed()
+                on_unconfirmed = None
             self._sleep(min(self._poll_seconds, 5.0))
+        raise RepairError(f"could not confirm {tid} paused; leaving files in place")
 
-    def _rollback(self, tid: str, snapshot: dict, linked: List[FilePlan]) -> None:
+    def _pause_for_rollback(self, tid: str, snapshot: dict) -> bool:
+        guard_reasserted = False
+
+        def reassert_guard() -> None:
+            nonlocal guard_reasserted
+            if guard_reasserted:
+                return
+            guard_reasserted = True
+            for setting, restore in (
+                ("guard options", lambda: self._set_guard_options(tid)),
+                ("zero priorities", lambda: self._set_priorities(tid, [0] * len(snapshot["file_priorities"]))),
+            ):
+                try:
+                    restore()
+                except Exception as exc:
+                    logger.error("Could not confirm {} for {}: {}", setting, tid, exc)
+
+        try:
+            self._wait_for_pause(tid, ["state", "paused"], on_unconfirmed=reassert_guard)
+        except Exception:
+            reassert_guard()  # Also cover RPC failure before the first poll.
+            raise
+        return guard_reasserted
+
+    def _rollback(self, tid: str, snapshot: dict, linked: List[Tuple[FilePlan, Tuple[int, int]]]) -> None:
         """Restore original files, re-recheck so the piece map matches disk, leave paused."""
-        self._pause_and_settle(tid)
+        self._pause_for_rollback(tid, snapshot)
         self._rollback_files(linked)
         try:
-            self._guarded_recheck(tid, snapshot)
-        except Exception as exc:
-            logger.warning("Rollback recheck for {} failed: {}", tid, exc)
-        self._set_priorities(tid, snapshot["file_priorities"])
-        self._restore_options(tid, snapshot)
-        _call(self._client, "core.pause_torrent", [tid])
+            _, result = self._guarded_recheck(tid, snapshot)
+            if result != "done":
+                raise RepairError(result)
+        finally:
+            self._pause_for_rollback(tid, snapshot)
+            # Deluge normally records the preference without restarting a
+            # manually paused handle. Keep the cap and zero priorities until
+            # pause is confirmed even if setting it does trigger a restart.
+            wanted = snapshot["file_priorities"]
+            zero_priorities = [0] * len(wanted)
+            guard = _torrent_status(self._client, tid, [*GUARD_OPTION_KEYS, "file_priorities"])
+            try:
+                self._verify_guard_options(guard)
+            except RepairError:
+                self._set_guard_options(tid)
+            if list(guard.get("file_priorities") or []) != zero_priorities:
+                self._set_priorities(tid, zero_priorities)
+            try:
+                _call(self._client, "core.set_torrent_options", [tid], {"auto_managed": snapshot["auto_managed"]})
+            except Exception:
+                # The daemon may have applied the write before losing the
+                # reply. Confirm pause without releasing the other guards.
+                try:
+                    self._pause_for_rollback(tid, snapshot)
+                except Exception as exc:
+                    logger.error("Cannot confirm pause for {} after ambiguous auto-management write: {}", tid, exc)
+                raise
+            if self._pause_for_rollback(tid, snapshot):
+                raise RepairError("pause was delayed after restoring auto-management; guard reasserted, inspect settings manually")
+            self._set_priorities(tid, wanted)
+            _call(self._client, "core.set_torrent_options", [tid], {"max_download_speed": snapshot["max_download_speed"]})
 
-    def _best_effort_restore(self, tid: str, snapshot: Optional[dict], linked: List[FilePlan]) -> None:
+    def _best_effort_restore(self, tid: str, snapshot: Optional[dict], linked: List[Tuple[FilePlan, Tuple[int, int]]]) -> None:
+        if snapshot is None:
+            return
         try:
-            if snapshot:
-                self._rollback(tid, snapshot, linked)
-            else:
-                _call(self._client, "core.pause_torrent", [tid])
-                self._rollback_files(linked)
+            self._rollback(tid, snapshot, linked)
         except Exception as exc:
             logger.error("Best-effort restore for {} also failed: {} — check this torrent manually", tid, exc)
 
