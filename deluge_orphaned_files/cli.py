@@ -42,6 +42,7 @@ from .logic.orphan_finder import InodePreflightError, compute_orphans
 from .logic.autoremove import process_autoremove_labeling
 from .logic.missing_payloads import reconcile_missing_payloads
 from .logic.stuck_repair import run_stuck_repair
+from .logic.tracker_rejections import run_tracker_rejections
 from .logic.pending_actions import (
     init_pending_actions_schema,
     execute_pending_actions as execute_all_pending_actions,
@@ -2121,6 +2122,19 @@ def main() -> None:
         "With --execute-pending-actions this previews removal, or removes due registrations only if --force is also set.",
     )
 
+    tracker_group = parser.add_argument_group("Tracker Registration Cleanup")
+    tracker_mode = tracker_group.add_mutually_exclusive_group()
+    tracker_mode.add_argument(
+        "--tracker-rejected-torrents",
+        action="store_true",
+        help="Standalone dry run: preview queuing and rechecking terminal tracker rejections without making changes.",
+    )
+    tracker_mode.add_argument(
+        "--apply-tracker-rejected-removals",
+        action="store_true",
+        help="Standalone: queue terminal tracker rejections and recheck due removals, keeping local data.",
+    )
+
     # Stuck cross-seed repair group (standalone; issue #1)
     repair_group = parser.add_argument_group("Stuck Torrent Repair")
     repair_group.add_argument(
@@ -2159,6 +2173,10 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    tracker_cleanup = args.tracker_rejected_torrents or args.apply_tracker_rejected_removals
+    if tracker_cleanup and (args.repair_stuck_torrents or args.apply_stuck_repairs):
+        parser.error("tracker registration cleanup and stuck torrent repair cannot run together")
 
     # Early-exit helper flags -------------------------------------------------
     if args.list_env:
@@ -2205,6 +2223,11 @@ def main() -> None:
             format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
         )
         logger.trace("Trace logging enabled.")
+
+    if tracker_cleanup:
+        if not run_tracker_rejections(config, dry_run=not args.apply_tracker_rejected_removals):
+            sys.exit(1)
+        return
 
     # Record the flags and thresholds in effect so a log file read months later is
     # self-describing and does not require guessing how the run was invoked.
