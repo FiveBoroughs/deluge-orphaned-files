@@ -43,6 +43,7 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
         deluge_username: Username for Deluge RPC authentication.
         deluge_password: Password for Deluge RPC authentication.
         deluge_torrent_base_remote_folder: Base folder for torrents on the Deluge server.
+        deluge_media_base_remote_folder: Base folder for media on the Deluge server (reconciliation only).
         local_torrent_base_local_folder: Local base folder for torrent files.
         local_media_base_local_folder: Local base folder for media files.
         output_file: Path where output reports will be saved.
@@ -73,6 +74,7 @@ class AppConfig(BaseSettings):  # noqa: C901 – long but mostly field declarati
 
     # Base folders
     deluge_torrent_base_remote_folder: str = Field(alias="DELUGE_TORRENT_BASE_REMOTE_FOLDER")
+    deluge_media_base_remote_folder: Optional[str] = Field(default=None, alias="DELUGE_MEDIA_BASE_REMOTE_FOLDER")
     local_torrent_base_local_folder: Path = Field(alias="LOCAL_TORRENT_BASE_LOCAL_FOLDER")
     local_media_base_local_folder: Path = Field(alias="LOCAL_MEDIA_BASE_LOCAL_FOLDER")
 

@@ -194,6 +194,27 @@ Runs never overlap; a run that overruns its slot skips the missed fire rather th
 
 **Migrating from an external cron/start-on-schedule setup** (e.g. TrueNAS cron job starting the container): set `CRON_SCHEDULE`, change the app restart policy to *unless-stopped*, and remove the external cron job.
 
+### Retiring Deluge registrations with entirely missing payloads
+
+When a retention tool deletes media, Deluge can continue to report the affected torrents as seeding. `--reconcile-missing-payloads` adds a separate, opt-in inventory pass to the normal scan. It checks every Deluge infohash (including torrents sharing the same files), and never unlinks data.
+
+Set `DELUGE_MEDIA_BASE_REMOTE_FOLDER` to the absolute path Deluge uses for the media root, corresponding to `LOCAL_MEDIA_BASE_LOCAL_FOLDER`. The existing `DELUGE_TORRENT_BASE_REMOTE_FOLDER` and `LOCAL_TORRENT_BASE_LOCAL_FOLDER` settings map the torrent root. The two remote roots must not overlap. The pass checks locations in Deluge's file inventory, not similarly named files elsewhere. Use roots on the actual mounted storage, not parents of separate, nested mounts.
+
+Place a regular file named `.delugeof-root` at the top of **each** local root, on the intended storage while it is mounted (an empty file is enough). Do not put the marker in the underlying mountpoint; otherwise it cannot establish whether the storage is present. Both roots and markers must be accessible and are checked again before removal. An unreadable path, malformed or unmapped inventory, or failed RPC does not count as evidence of absence.
+
+```bash
+# Preview only: no candidate state changes and no registrations removed
+python -m deluge_orphaned_files.cli --sqlite --reconcile-missing-payloads --execute-pending-actions
+
+# Record observations over multiple runs without removing any registrations
+python -m deluge_orphaned_files.cli --sqlite --reconcile-missing-payloads
+
+# Retire due registrations. WARNING: --force also lets legacy pending actions delete orphan files.
+python -m deluge_orphaned_files.cli --sqlite --reconcile-missing-payloads --execute-pending-actions --force
+```
+
+An observation counts only if Deluge reports a complete seed (`Seeding` or a completed `Paused` seed) and every listed payload path is absent. A file that reappears or a move/re-add breaks the streak. Both `DELETION_CONSECUTIVE_SCANS_THRESHOLD` and `DELETION_DAYS_THRESHOLD` apply (default 7 observations and 7 days); even a threshold below two requires two separate successful observations. Before each removal the pass rechecks the individual torrent and all of its paths, then asks Deluge to remove that one registration with `remove_data=False`. These flags do not change how the legacy orphan-file workflow behaves; `--execute-pending-actions --force` still also executes legacy actions.
+
 ### Repairing stuck cross-seed torrents
 
 cross-seed injects partial matches paused and only resumes them when little is missing, so some torrents sit paused-incomplete forever even though every missing file already exists on disk, verified complete in another torrent. Two standalone flags (no scan) find and fix those:
