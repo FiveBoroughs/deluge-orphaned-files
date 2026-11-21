@@ -40,6 +40,7 @@ from .database.hash_cache import (  # noqa: F401 – some imports are kept for b
 )
 from .logic.orphan_finder import InodePreflightError, compute_orphans
 from .logic.autoremove import process_autoremove_labeling
+from .logic.missing_payloads import reconcile_missing_payloads
 from .logic.stuck_repair import run_stuck_repair
 from .logic.pending_actions import (
     init_pending_actions_schema,
@@ -2113,6 +2114,12 @@ def main() -> None:
         action="store_true",
         help="Execute pending actions that are due (e.g., apply deferred labels). Use with --force to actually apply changes.",
     )
+    file_group.add_argument(
+        "--reconcile-missing-payloads",
+        action="store_true",
+        help="Track Deluge torrents whose entire payload is missing (requires --sqlite). "
+        "With --execute-pending-actions this previews removal, or removes due registrations only if --force is also set.",
+    )
 
     # Stuck cross-seed repair group (standalone; issue #1)
     repair_group = parser.add_argument_group("Stuck Torrent Repair")
@@ -2161,6 +2168,12 @@ def main() -> None:
     if args.repair_stuck_torrents or args.apply_stuck_repairs:
         run_stuck_repair(config, apply=args.apply_stuck_repairs)
         return
+
+    if args.reconcile_missing_payloads:
+        if not args.sqlite:
+            parser.error("--reconcile-missing-payloads requires --sqlite")
+        if not config.deluge_media_base_remote_folder:
+            parser.error("--reconcile-missing-payloads requires DELUGE_MEDIA_BASE_REMOTE_FOLDER")
 
     if args.debug:
         logger.remove()
@@ -2325,6 +2338,13 @@ def main() -> None:
             deluge_client.connect()
             if deluge_client.connected:
                 logger.debug("Successfully connected to Deluge for labeling.")
+                if args.reconcile_missing_payloads:
+                    reconcile_missing_payloads(
+                        config,
+                        deluge_client,
+                        execute=args.execute_pending_actions,
+                        dry_run=args.execute_pending_actions and not args.force,
+                    )
                 process_autoremove_labeling(
                     client=deluge_client,
                     scan_id=scan_id,
