@@ -207,6 +207,88 @@ Eligible torrents are paused, incomplete, labelled `cross-seed` or `*.cross-seed
 
 The verification recheck runs with all file priorities at 0, a `REPAIR_MAX_DOWNLOAD_SPEED_KIB` cap and auto-management off; if more than `REPAIR_DOWNLOAD_ABORT_MB` (1 MB) downloads anyway, the repair aborts. Torrents that verify 100% are resumed and their backups deleted; the rest get their original files restored plus a re-recheck, and are reported as still stuck (attempts tracked in `stuck-repair-state.json`). Nothing is ever removed. A run is skipped below `REPAIR_MIN_FREE_GB` (10 GB) free space, and a lock prevents overlapping runs. In scheduled (daemon) mode, add the flags to the container command as a separate scheduled invocation or run them manually with `docker exec`.
 
+#### Planning sidecar recovery (issue #3)
+
+When local hardlinks alone can't repair a variant, run the standalone v1 planner:
+
+```bash
+python -m deluge_orphaned_files.sidecar_plan \
+  --manifest /input/variants.json --metainfo-dir /input/metainfo
+# Optional: --torrent FULL_40_HEX_INFOHASH
+```
+
+Provide trusted `.torrent` files named `<lowercase-infohash>.torrent` for the
+targets and for complete reference torrents that contain the same media inodes.
+The JSON manifest maps each exact **target** infohash to an object such as:
+
+```json
+{
+  "1111111111111111111111111111111111111111": {
+    "sidecars": ["Mapped Release/subtitles.srt", "Mapped Release/sample.nfo"],
+    "media_sources": ["2222222222222222222222222222222222222222"]
+  }
+}
+```
+
+Declare only genuinely optional files, using **current Deluge paths relative to
+that torrent's save directory**, and choose references that are known to have
+the same media bytes. The command uses `DELUGE_HOST`, `DELUGE_PORT`, `DELUGE_USERNAME`,
+`DELUGE_PASSWORD`, `DELUGE_TORRENT_BASE_REMOTE_FOLDER` and
+`LOCAL_TORRENT_BASE_LOCAL_FOLDER` (environment or `.env`). Use a trusted Deluge
+2.2.x endpoint and transport, admin credentials for full inventory visibility,
+the Label plugin, and a stable local read-only view of the same payload tree.
+Targets must be individually paused, incomplete, labeled `cross-seed` or
+`*.cross-seed`; all files must be wanted (nonzero priority).
+No scan, cache, workspace, torrent changes, or file writes are needed. JSON is
+written to stdout; blocked variants include the reason and make the exit
+status nonzero.
+
+The planner requires the daemon's missing piece indices to exactly match the
+spans of absent declared sidecars. It hashes each readable target piece against
+the target metainfo and hashes the complete references to authenticate the
+shared media inodes, including bytes in pieces that cross absent sidecars.
+It rejects incomplete piece maps, unsafe paths, shared destinations, partial
+files, and unsupported metainfo (v2/hybrid, pad or symlink files), rather than
+estimating from file progress. For same-name/size sidecar donors, it checks
+every affected target piece with the original media before counting the donor.
+It reports absent sidecar bytes and affected piece bytes separately, including
+the short final piece, then ranks the remaining work after proven local donors.
+`remaining_piece_bytes` is the amount of unresolved piece data, not a transfer
+ceiling. Bytes expected by the target in an unhashable boundary piece can only
+be confirmed once the missing bytes are recovered. A plan is an observation,
+not a reservation, and does not authorize any torrent operation.
+The destination check requires an alias-free Deluge inventory: different save
+paths must not resolve to the same directory through symlinks or bind mounts.
+
+**Automated bounded download and apply are unavailable.** Stock Deluge 2.2
+[`move_storage`](https://github.com/deluge-torrent/deluge/blob/deluge-2.2.0/deluge/core/torrent.py#L1279-L1316)
+uses libtorrent's
+[`dont_replace`](https://github.com/arvidn/libtorrent/blob/v2.0.11/include/libtorrent/torrent_handle.hpp#L1314-L1326)
+mode, which removes source paths even when pre-staged destination files exist
+and can move/copy data; `download_location` changes an option, not the live
+storage. There is no safe stock RPC to switch both directions without risking
+the original paths. Deluge's
+[`force_recheck`](https://github.com/deluge-torrent/deluge/blob/deluge-2.2.0/deluge/core/torrent.py#L1411-L1426)
+also calls `resume()` internally. A rate cap and CLI counter polling cannot
+enforce a torrent-wide payload budget if the client dies, disconnects, stalls,
+or the daemon restarts. Finally, [cross-seed builds donor paths from the
+Deluge inventory](https://github.com/cross-seed/cross-seed/blob/4f86d0a8cf5d3e8022ae3ac1717ba5a5eef9a032/cross-seed/src/clients/Deluge.ts#L891-L992),
+not just from configured data directories. A private directory or this app's
+lock alone cannot keep an injecting job from discovering or linking its inodes.
+
+Execution requires a daemon-owned admission/watchdog and transfer guard with a
+bounded allowance for in-flight and redundant data, a non-destructive
+save-path switch and completion acknowledgement, and operational exclusion
+of external cross-seed inventory/injection for the entire workspace lifetime
+(including interruption). It must force reflinks without a copy fallback,
+verify private inodes and the isolated missing-piece map without changing file
+priorities, preserve interrupted work, verify recovered sidecars against target
+and sibling piece hashes on original media, and explicitly recheck after
+returning. Resume only at 100% with zero remaining bytes; remove the workspace
+only after verifying that no torrent retains its paths or inodes. The planner
+does none of those mutations. The existing download-free repair above is
+unchanged.
+
 ## Output Format
 
 The script generates a JSON file with the following structure:
